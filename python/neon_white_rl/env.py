@@ -79,6 +79,7 @@ class NeonWhiteEnv(Env):
         self._episode_steps = 0
         self._connected = False
         self._last_obs: Optional[Dict[str, Any]] = None
+        self._escape_requested = False
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
@@ -100,6 +101,7 @@ class NeonWhiteEnv(Env):
         self._events.clear()
         self._latest_level = None
         self._last_obs = None
+        self._escape_requested = False
 
     def _close_socket(self) -> None:
         if self._writer is not None:
@@ -121,10 +123,17 @@ class NeonWhiteEnv(Env):
         self._reader = None
         self._writer = None
         self._connected = False
+        self._escape_requested = False
 
     # ------------------------------------------------------------------
     # Communication helpers
     # ------------------------------------------------------------------
+
+    def _queue_event(self, event: Dict[str, Any]) -> None:
+        """Store bridge events and track escape requests."""
+        if event.get("name") == "esc_pressed":
+            self._escape_requested = True
+        self._events.append(event)
 
     def _send_command(self, name: str, **payload: Any) -> None:
         if not self._connected or self._writer is None:
@@ -155,7 +164,7 @@ class NeonWhiteEnv(Env):
                 if target_level is None or pkt.get("level") == target_level:
                     return
             elif ptype == "event":
-                self._events.append(pkt)
+                self._queue_event(pkt)
             elif ptype == "obs":
                 # ignore stale obs while loading levels
                 continue
@@ -170,7 +179,7 @@ class NeonWhiteEnv(Env):
                 self._last_obs = pkt
                 return pkt
             if ptype == "event":
-                self._events.append(pkt)
+                self._queue_event(pkt)
                 continue
             if ptype == "ready":
                 self._latest_level = pkt.get("level")
@@ -195,6 +204,7 @@ class NeonWhiteEnv(Env):
 
         self._events.clear()
         self._episode_steps = 0
+        self._escape_requested = False
 
         stage = options.get("stage", self.config.default_stage)
         level = options.get("level")
@@ -238,6 +248,8 @@ class NeonWhiteEnv(Env):
         done = bool(obs.get("done", False))
         terminated = done
         truncated = False
+        if self._escape_requested:
+            truncated = True
         info = self._build_info(obs, reset=False)
         self._episode_steps += 1
         return observation, reward, terminated, truncated, info
@@ -311,6 +323,7 @@ class NeonWhiteEnv(Env):
             "stage": int(obs.get("stage", 0)),
             "raw_obs": obs,
             "reset": reset,
+            "escape_requested": self._escape_requested,
         }
         death_reason = obs.get("death_reason")
         if death_reason:

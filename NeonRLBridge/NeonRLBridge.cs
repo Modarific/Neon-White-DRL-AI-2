@@ -1,4 +1,4 @@
-﻿// NeonRLBridge.cs
+// NeonRLBridge.cs
 // Build as a MelonLoader mod. Tested with Unity 2019+ APIs.
 // Requires: MelonLoader, UnityEngine.
 // Place the compiled DLL in Neon White/Mods, run the game, then connect from Python.
@@ -18,10 +18,14 @@ using System.Net.Sockets;
 using System.Text;
 using System.Threading;
 using System.Diagnostics;
+using System.Reflection;
 using HarmonyLib;
 using MelonLoader;
 using UnityEngine;
 using UnityEngine.SceneManagement;
+using UnityEngine.InputSystem;
+using UnityEngine.InputSystem.Controls;
+using UnityEngine.InputSystem.LowLevel;
 using System.Collections.Generic;
 
 [assembly: MelonInfo(typeof(NeonRLBridge.NeonRLBridge), "NeonRLBridge", "1.1.0", "your-name")]
@@ -84,7 +88,7 @@ namespace NeonRLBridge
     [Serializable]
     public class EventPacket
     {
-        public string type = \"event\";
+        public string type = "event";
         public string name;
         public string payload;
     }
@@ -388,7 +392,19 @@ namespace NeonRLBridge
         {
             InputOverride.FrameTick();
 
-            if (Input.GetKeyDown(KeyCode.Escape))
+            bool escPressed = InputSystemShim.WasEscapePressedThisFrame();
+
+            if (!escPressed && !InputSystemShim.IsInputSystemPresent && Input.GetKeyDown(KeyCode.Escape))
+            {
+                escPressed = true;
+            }
+
+            if (!escPressed && InputOverride.TryGetKey(KeyCode.Escape, InputOverride.KeyQuery.Down, out bool overrideEsc) && overrideEsc)
+            {
+                escPressed = true;
+            }
+
+            if (escPressed)
             {
                 SendEvent("esc_pressed");
             }
@@ -433,42 +449,137 @@ namespace NeonRLBridge
             SafeWrite(JsonUtility.ToJson(evt));
         }
 
-        void SendObs()
+        internal static class InputSystemShim
         {
-            if (player == null)
-            {
-                // keep trying every send tick until found
-                FindPlayer();
-                if (player == null)
-                {
-                    // still nothing â†’ send a minimal heartbeat so Python stays alive
-                    var pktHeartbeat = new ObsPacket {
-                        pos = new float[] {0f,0f,0f},
-                        vel = new float[] {0f,0f,0f},
-                        yaw_deg = 0f,
-                        goal_dist = 9999f,
-                        goal_dir = new float[] {0f,1f},
-                        grounded = false,
-                        surface = 0,
-                        height_gap = 0f,
-                        reached = false,
-                        stage = stage,
-                        death_reason = "no_player",
-                        reward = 0f,
-                        done = false,
-                        kills_total = killsTotal,
-                        time_unscaled = Time.unscaledTime,
+            static Type keyboardType;
+            static PropertyInfo keyboardCurrentProp;
+            static PropertyInfo keyboardEscapeProp;
 
-                        enemies_n = 0,
-                        enemies_pos = null,
-                        nearest_enemy_dist = -1f,
-                        nearest_enemy_dir = new float[] {0f,1f}
-                    };
-                    SafeWrite(JsonUtility.ToJson(pktHeartbeat));
-                    return;
+            static Type gamepadType;
+            static PropertyInfo gamepadCurrentProp;
+            static PropertyInfo gamepadStartProp;
+            static PropertyInfo gamepadSelectProp;
+
+            static Type buttonControlType;
+            static PropertyInfo wasPressedProp;
+
+            static void EnsureTypes()
+            {
+                if (keyboardType == null)
+                {
+                    keyboardType = ResolveType("UnityEngine.InputSystem.Keyboard, Unity.InputSystem");
+                    if (keyboardType != null)
+                    {
+                        keyboardCurrentProp = keyboardType.GetProperty("current", BindingFlags.Public | BindingFlags.Static);
+                        keyboardEscapeProp = keyboardType.GetProperty("escapeKey", BindingFlags.Public | BindingFlags.Instance);
+                    }
+                }
+
+                if (gamepadType == null)
+                {
+                    gamepadType = ResolveType("UnityEngine.InputSystem.Gamepad, Unity.InputSystem");
+                    if (gamepadType != null)
+                    {
+                        gamepadCurrentProp = gamepadType.GetProperty("current", BindingFlags.Public | BindingFlags.Static);
+                        gamepadStartProp = gamepadType.GetProperty("startButton", BindingFlags.Public | BindingFlags.Instance);
+                        gamepadSelectProp = gamepadType.GetProperty("selectButton", BindingFlags.Public | BindingFlags.Instance);
+                    }
+                }
+
+                if (buttonControlType == null)
+                {
+                    buttonControlType = ResolveType("UnityEngine.InputSystem.Controls.ButtonControl, Unity.InputSystem");
+                    if (buttonControlType != null)
+                    {
+                        wasPressedProp = buttonControlType.GetProperty("wasPressedThisFrame", BindingFlags.Public | BindingFlags.Instance);
+                    }
                 }
             }
 
+            static Type ResolveType(string qualifiedName)
+            {
+                var type = Type.GetType(qualifiedName, false);
+                if (type != null)
+                    return type;
+
+                var simpleName = qualifiedName.Split(',')[0];
+                foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+                {
+                    try
+                    {
+                        type = asm.GetType(simpleName, false);
+                        if (type != null)
+                            return type;
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                return null;
+            }
+
+            internal static bool IsInputSystemPresent
+            {
+                get
+                {
+                    EnsureTypes();
+                    return keyboardType != null || gamepadType != null;
+                }
+            }
+
+            internal static bool WasEscapePressedThisFrame()
+            {
+                EnsureTypes();
+
+                if (wasPressedProp == null)
+                    return false;
+
+                try
+                {
+                    if (keyboardCurrentProp != null && keyboardEscapeProp != null)
+                    {
+                        var keyboard = keyboardCurrentProp.GetValue(null);
+                        if (keyboard != null)
+                        {
+                            var escape = keyboardEscapeProp.GetValue(keyboard);
+                            if (escape != null && wasPressedProp.GetValue(escape) is bool pressed && pressed)
+                                return true;
+                        }
+                    }
+
+                    if (gamepadCurrentProp != null)
+                    {
+                        var gamepad = gamepadCurrentProp.GetValue(null);
+                        if (gamepad != null)
+                        {
+                            if (gamepadStartProp != null)
+                            {
+                                var start = gamepadStartProp.GetValue(gamepad);
+                                if (start != null && wasPressedProp.GetValue(start) is bool startPressed && startPressed)
+                                    return true;
+                            }
+
+                            if (gamepadSelectProp != null)
+                            {
+                                var select = gamepadSelectProp.GetValue(gamepad);
+                                if (select != null && wasPressedProp.GetValue(select) is bool selectPressed && selectPressed)
+                                    return true;
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                    // ignore reflection errors
+                }
+
+                return false;
+            }
+        }
+
+        void SendObs()
+        {
             if (writer == null) return;
 
             if (player == null) FindPlayer();
@@ -1429,6 +1540,7 @@ namespace NeonRLBridge
             next.dDown = next.d && !previous.d;
             next.dUp = !next.d && previous.d;
 
+            InputSystemDriver.Sync(previous, next);
             current = next;
             lastFrameProcessed = frame;
 
@@ -1447,6 +1559,97 @@ namespace NeonRLBridge
             }
         }
 
+        static class InputSystemDriver
+        {
+            static bool KeyboardChanged(FrameSnapshot prev, FrameSnapshot curr)
+            {
+                return prev.w != curr.w || prev.a != curr.a || prev.s != curr.s || prev.d != curr.d || prev.jump != curr.jump || prev.reset != curr.reset;
+            }
+
+            static bool MouseButtonsChanged(FrameSnapshot prev, FrameSnapshot curr)
+            {
+                return prev.shoot != curr.shoot || prev.use != curr.use;
+            }
+
+            static KeyboardState BuildKeyboardState(FrameSnapshot frame)
+            {
+                List<Key> keys = new List<Key>(6);
+                if (frame.w)
+                {
+                    keys.Add(Key.W);
+                }
+                if (frame.a)
+                {
+                    keys.Add(Key.A);
+                }
+                if (frame.s)
+                {
+                    keys.Add(Key.S);
+                }
+                if (frame.d)
+                {
+                    keys.Add(Key.D);
+                }
+                if (frame.jump)
+                {
+                    keys.Add(Key.Space);
+                }
+                if (frame.reset)
+                {
+                    keys.Add(Key.F);
+                }
+
+                if (keys.Count == 0)
+                {
+                    return new KeyboardState();
+                }
+
+                return new KeyboardState(keys.ToArray());
+            }
+
+            static MouseState BuildMouseState(FrameSnapshot frame)
+            {
+                var state = new MouseState();
+                state = state.WithButton(MouseButton.Left, frame.shoot);
+                state = state.WithButton(MouseButton.Right, frame.use);
+                return state;
+            }
+
+            static void QueueLookDelta(FrameSnapshot frame)
+            {
+                var mouse = Mouse.current;
+                if (mouse == null)
+                    return;
+                if (Mathf.Approximately(frame.lookX, 0f) && Mathf.Approximately(frame.lookY, 0f))
+                    return;
+                InputSystem.QueueDeltaStateEvent(mouse.delta, new Vector2(frame.lookX, frame.lookY));
+            }
+
+            public static void Sync(FrameSnapshot previous, FrameSnapshot current)
+            {
+                if (!global::NeonRLBridge.NeonRLBridge.InputSystemShim.IsInputSystemPresent)
+                    return;
+
+                var keyboard = Keyboard.current;
+                if (keyboard != null && KeyboardChanged(previous, current))
+                {
+                    var state = BuildKeyboardState(current);
+                    InputSystem.QueueStateEvent(keyboard, state);
+                }
+
+                var mouse = Mouse.current;
+                if (mouse != null)
+                {
+                    if (MouseButtonsChanged(previous, current))
+                    {
+                        var mouseState = BuildMouseState(current);
+                        InputSystem.QueueStateEvent(mouse, mouseState);
+                    }
+
+                    QueueLookDelta(current);
+                }
+            }
+        }
         static bool QueryMovement(KeyQuery query, MovementKey key, FrameSnapshot frame)
         {
             return query switch
@@ -1573,7 +1776,7 @@ namespace NeonRLBridge
 
     internal static class InputPatches
     {
-        static Harmony harmony;
+        static HarmonyLib.Harmony harmony;
 
         public static void Install()
         {
@@ -1582,7 +1785,7 @@ namespace NeonRLBridge
                 return;
             }
 
-            harmony = new Harmony("NeonRLBridge.InputOverride");
+            harmony = new HarmonyLib.Harmony("NeonRLBridge.InputOverride");
             harmony.PatchAll(typeof(InputPatches));
         }
 

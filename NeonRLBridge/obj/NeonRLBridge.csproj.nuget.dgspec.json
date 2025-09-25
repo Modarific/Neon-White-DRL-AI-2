@@ -1,0 +1,59 @@
+{
+  "format": 1,
+  "restore": {
+    "C:\\Users\\Kegan\\Neon-White-DRL-AI\\NeonRLBridge\\NeonRLBridge.csproj": {}
+  },
+  "projects": {
+    "C:\\Users\\Kegan\\Neon-White-DRL-AI\\NeonRLBridge\\NeonRLBridge.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "C:\\Users\\Kegan\\Neon-White-DRL-AI\\NeonRLBridge\\NeonRLBridge.csproj",
+        "projectName": "NeonRLBridge",
+        "projectPath": "C:\\Users\\Kegan\\Neon-White-DRL-AI\\NeonRLBridge\\NeonRLBridge.csproj",
+        "packagesPath": "C:\\Users\\Kegan\\.nuget\\packages\\",
+        "outputPath": "C:\\Users\\Kegan\\Neon-White-DRL-AI\\NeonRLBridge\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\Kegan\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net48"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net48": {
+            "targetAlias": "net48",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        },
+        "SdkAnalysisLevel": "9.0.300"
+      },
+      "frameworks": {
+        "net48": {
+          "targetAlias": "net48",
+          "dependencies": {
+            "Microsoft.NETFramework.ReferenceAssemblies": {
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[1.0.3, )",
+              "autoReferenced": true
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\9.0.305\\RuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}
