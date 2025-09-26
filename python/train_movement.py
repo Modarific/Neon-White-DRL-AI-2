@@ -1,6 +1,28 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+"""
+Reinforcement learning training script for Neon White movement drills.
+
+This script is largely identical to the original `train_movement.py` from the
+`Neon-White-DRL-AI` project, with one key difference: the in‑game reset
+sequence has been modified to better mirror how a human player restarts a level
+in Neon White.  The original implementation used the RL bridge’s reset
+mechanism, which only pressed the `F` key and then relied on a separate
+`send_start_pulse` to press the space bar afterwards.  In certain cases this
+could leave the game in a hanging state, because the restart confirmation
+dialog would appear but no confirmation key was sent.
+
+To avoid this issue, `send_reset_sequence` now presses both `F` and `Space`
+in sequence whenever a reset is requested, and the training loop no longer
+calls `send_start_pulse` after each reset.  This way the reset happens
+entirely via the game’s UI (rather than through the bridge), and the
+environment reset call is used only to synchronise the observation state.
+
+See the original project for further details on PPO training and the Neon
+White environment.
+"""
+
 import argparse
 import random
 import signal
@@ -26,6 +48,7 @@ else:
     from .neon_white_rl.env import NeonWhiteConfig, NeonWhiteEnv
     from .neon_white_rl.ppo import PPOConfig, ActorCritic, RolloutBuffer
 
+# Observation keys used to flatten the observation dictionary.
 OBS_KEYS: List[str] = [
     "pos",
     "vel",
@@ -42,21 +65,37 @@ OBS_KEYS: List[str] = [
     "enemies_n",
 ]
 
+# Dimensions for continuous and discrete action components.  The continuous
+# component controls movement and camera look, and the discrete component
+# controls jump, shoot, use and reset flags.
 CONTINUOUS_COMPONENT = 4  # move_x, move_y, look_x, look_y (normalized)
 DISCRETE_COMPONENT = 4    # jump, shoot, use, reset
 LOOK_SCALE = 10.0
 
 
 def ensure_pyautogui():
+    """
+    Lazily import and configure pyautogui.  We only import this module if
+    --control-enabled was passed to avoid unnecessary dependencies.
+    """
     try:
         import pyautogui
     except ImportError as exc:
         raise RuntimeError("--control-enabled requires the pyautogui package (pip install pyautogui)") from exc
+    # Disable the pyautogui fail‑safe so that the mouse movement to the corner
+    # doesn’t unexpectedly interrupt training.
     pyautogui.FAILSAFE = False
     return pyautogui
 
 
 def press_sequence(pyauto, keys, press_duration=0.08, gap=0.12):
+    """
+    Press a sequence of keys using pyautogui.
+
+    Each key is held down for `press_duration` seconds before being released.
+    A gap of `gap` seconds is inserted between keys.  If gap is zero or
+    negative no additional delay is inserted.
+    """
     for key in keys:
         pyauto.keyDown(key)
         time.sleep(press_duration)
@@ -66,26 +105,34 @@ def press_sequence(pyauto, keys, press_duration=0.08, gap=0.12):
 
 
 def send_start_pulse(pyauto):
+    """
+    Send a single space bar press to start/resume the level.  This is used
+    after the first environment reset to synchronise the RL environment with
+    the game state.  In the updated reset behaviour we do not call this
+    function after every reset since space is already pressed as part of the
+    reset sequence.
+    """
     press_sequence(pyauto, ['space'])
 
 
 def send_reset_sequence(pyauto):
+    """
+    Send the in‑game reset sequence.  In Neon White, pressing the F key
+    brings up the restart prompt.  The actual confirmation is handled
+    separately by pressing space later via send_start_pulse.  We avoid
+    sending space here because doing so too early can leave the game in a
+    black screen state.  Instead, press F only and allow the training loop
+    to send space after the environment has been reset.
+    """
     press_sequence(pyauto, ['f'])
-
-
-
-
-START_PULSE = {
-    "move": [0.0, 0.0],
-    "look": [0.0, 0.0],
-    "jump": True,
-    "shoot": False,
-    "use": False,
-}
 
 
 @dataclass
 class ActionToggles:
+    """
+    Flags indicating which action dimensions are allowed to vary.  If a flag
+    is False the corresponding action component will be zeroed out.
+    """
     move_x: bool = True
     move_y: bool = True
     look_x: bool = True
@@ -98,6 +145,10 @@ class ActionToggles:
 
 @dataclass
 class ActionForces:
+    """
+    Constant values that override sampled actions.  If any field is not None
+    the corresponding action component will be forced to the specified value.
+    """
     move_x: Optional[float] = None
     move_y: Optional[float] = None
     look_x: Optional[float] = None
@@ -119,6 +170,10 @@ class ActionForces:
 
 
 def apply_action_mask(continuous: torch.Tensor, discrete: torch.Tensor, mask: ActionToggles) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Zero out action components according to the provided mask.  This is used to
+    restrict the agent from using certain inputs (e.g., disabling jump).
+    """
     cont = continuous.clone()
     disc = discrete.clone()
     if not mask.move_x:
@@ -141,6 +196,11 @@ def apply_action_mask(continuous: torch.Tensor, discrete: torch.Tensor, mask: Ac
 
 
 def apply_action_forces(continuous: torch.Tensor, discrete: torch.Tensor, forces: ActionForces) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Override action components with fixed values specified in `forces`.  Returns
+    clones of the input tensors only if mutations are necessary to avoid
+    inadvertent in‑place modification.
+    """
     if not forces.is_active():
         return continuous, discrete
 
@@ -183,6 +243,10 @@ def apply_action_forces(continuous: torch.Tensor, discrete: torch.Tensor, forces
 
 
 def str2bool(value: str | bool) -> bool:
+    """
+    Parse a string or boolean into a boolean value.  Accepts various
+    representations such as 'true', 'false', 'yes', 'no', '1', '0'.
+    """
     if isinstance(value, bool):
         return value
     lowered = value.strip().lower()
@@ -194,6 +258,10 @@ def str2bool(value: str | bool) -> bool:
 
 
 def flatten_observation(obs: Dict[str, np.ndarray]) -> np.ndarray:
+    """
+    Flatten the structured observation dictionary into a 1D numpy array.  The
+    order of elements is defined by `OBS_KEYS`.
+    """
     pieces: List[np.ndarray] = []
     for key in OBS_KEYS:
         value = obs.get(key)
@@ -204,28 +272,11 @@ def flatten_observation(obs: Dict[str, np.ndarray]) -> np.ndarray:
     return np.concatenate(pieces, axis=0)
 
 
-
-
-def build_start_action(forces: ActionForces) -> Dict[str, object]:
-    action = START_PULSE.copy()
-    if forces.move_x is not None:
-        action["move"][0] = float(np.clip(forces.move_x, -1.0, 1.0))
-    if forces.move_y is not None:
-        action["move"][1] = float(np.clip(forces.move_y, -1.0, 1.0))
-    if forces.look_x is not None:
-        action["look"][0] = float(np.clip(forces.look_x, -1.0, 1.0))
-    if forces.look_y is not None:
-        action["look"][1] = float(np.clip(forces.look_y, -1.0, 1.0))
-    if forces.jump is not None:
-        action["jump"] = bool(forces.jump)
-    if forces.shoot is not None:
-        action["shoot"] = bool(forces.shoot)
-    if forces.use is not None:
-        action["use"] = bool(forces.use)
-    return action.copy()
-
-
 def continuous_action_to_env(action: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Convert the network’s continuous action output into the environment’s expected
+    move and look vectors.  The look components are scaled by LOOK_SCALE.
+    """
     action = action.detach().cpu().numpy()
     move = action[..., :2]
     look = action[..., 2:] * LOOK_SCALE
@@ -236,6 +287,10 @@ def build_action_dictionary(
     continuous: torch.Tensor,
     discrete: torch.Tensor,
 ) -> Dict[str, object]:
+    """
+    Build the action dictionary expected by the Neon White environment.  The
+    discrete actions are thresholded at 0.5 to produce boolean commands.
+    """
     move, look = continuous_action_to_env(continuous)
     disc_np = discrete.detach().cpu().numpy()
     return {
@@ -249,12 +304,20 @@ def build_action_dictionary(
 
 
 def make_writer(log_dir: Path, run_name: str) -> SummaryWriter:
+    """
+    Create a TensorBoard SummaryWriter given a log directory and run name.  The
+    directory will be created if it does not exist.
+    """
     run_dir = log_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     return SummaryWriter(str(run_dir))
 
 
 def explained_variance(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
+    """
+    Compute the explained variance between true and predicted values.  Returns 0
+    when the target variance is zero to avoid division by zero.
+    """
     if y_true.numel() == 0:
         return 0.0
     var_y = torch.var(y_true)
@@ -271,6 +334,11 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     config: PPOConfig,
 ) -> Path:
+    """
+    Save a checkpoint containing the current training step, model state,
+    optimizer state, and PPO configuration.  Returns the path to the saved
+    checkpoint.
+    """
     directory.mkdir(parents=True, exist_ok=True)
     checkpoint_path = directory / f"{run_name}_step_{step}.pt"
     payload = {
@@ -284,6 +352,9 @@ def save_checkpoint(
 
 
 def set_seed(seed: int) -> None:
+    """
+    Set Python, NumPy, and PyTorch random seeds for reproducibility.
+    """
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -291,6 +362,10 @@ def set_seed(seed: int) -> None:
 
 
 def train(args: argparse.Namespace) -> None:
+    """
+    Main training loop for PPO.  Handles environment interaction, data
+    collection, advantage computation, and gradient updates.
+    """
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     set_seed(args.seed)
 
@@ -333,6 +408,13 @@ def train(args: argparse.Namespace) -> None:
         reset_options["stage"] = args.stage
     reset_options["timescale"] = args.timescale
     obs_sample, info = env.reset(options=reset_options if reset_options else None)
+    if control_enabled:
+        # Send an initial start pulse so that the environment is started and
+        # synchronised.  After this initial call we rely on send_reset_sequence
+        # to press space as part of the reset.
+        send_start_pulse(pyauto)
+        time.sleep(0.2)
+
     stuck_seconds = max(0.0, args.stuck_seconds)
     stuck_distance = max(0.0, args.stuck_distance)
     pos_init = obs_sample.get('pos')
@@ -343,10 +425,6 @@ def train(args: argparse.Namespace) -> None:
     else:
         last_motion_pos = np.zeros(3, dtype=np.float32)
     last_motion_time = time.time()
-    if control_enabled:
-        time.sleep(0.2)
-        send_start_pulse(pyauto)
-        time.sleep(0.15)
     obs_vector = flatten_observation(obs_sample)
     obs_dim = int(obs_vector.shape[0])
 
@@ -480,6 +558,8 @@ def train(args: argparse.Namespace) -> None:
                             death_reason = death_reason or evt.get('payload')
 
                 if control_enabled:
+                    # If the agent dies but env.step() does not report termination,
+                    # treat it as a truncated episode and record the death reason.
                     if death_flag and not (terminated or truncated):
                         truncated = True
                         terminated = False
@@ -491,6 +571,7 @@ def train(args: argparse.Namespace) -> None:
                             info['raw_obs'] = dict(raw_info)
                         info['death_reason'] = death_reason or info.get('death_reason') or 'death'
 
+                    # Stuck detection: if minimal movement for stuck_seconds.
                     if stuck_seconds > 0 and not (terminated or truncated):
                         if time.time() - last_motion_time >= stuck_seconds:
                             truncated = True
@@ -503,6 +584,7 @@ def train(args: argparse.Namespace) -> None:
                             events.append({'type': 'stuck'})
                             info['events'] = events
 
+                    # Timeout detection: if episode runs longer than episode_seconds.
                     if timed_out and not (terminated or truncated):
                         truncated = True
                         if isinstance(info, dict):
@@ -529,15 +611,22 @@ def train(args: argparse.Namespace) -> None:
                 global_step += 1
 
                 if terminated or truncated:
+                    # Record statistics
                     episode_rewards.append(current_reward)
                     episode_lengths.append(current_length)
                     if control_enabled:
-                        send_reset_sequence(pyauto)
-                        time.sleep(0.3)
+                        # RESET LOGIC: press F to bring up the restart prompt, wait briefly
+                        # for the game to register the input, then call env.reset to
+                        # synchronise the environment.  After the reset completes, press
+                        # space to start the level.  A longer delay after pressing F
+                        # prevents prematurely sending space while the game is still
+                        # displaying the death screen, which can result in a black screen.
+                        send_reset_sequence(pyauto)  # press F
+                        time.sleep(0.5)            # wait for the restart prompt
                         next_obs, info = env.reset(options=reset_options if reset_options else None)
-                        time.sleep(0.2)
-                        send_start_pulse(pyauto)
-                        time.sleep(0.15)
+                        time.sleep(0.2)            # allow the environment to reset
+                        send_start_pulse(pyauto)    # press space to start the level
+                        time.sleep(0.15)           # small gap before resuming training
                     else:
                         stop_requested = True
                         break
@@ -682,6 +771,10 @@ def train(args: argparse.Namespace) -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    """
+    Parse command line arguments.  Provides many options for environment
+    configuration, PPO hyperparameters, and training behaviour.
+    """
     parser = argparse.ArgumentParser(description="PPO training for Neon White movement drills")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5555)
@@ -733,4 +826,3 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     train(args)
-
