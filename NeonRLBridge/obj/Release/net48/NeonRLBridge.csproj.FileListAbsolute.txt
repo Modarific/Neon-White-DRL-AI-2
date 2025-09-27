@@ -5,3 +5,4 @@ C:\Users\Kegan\Neon-White-DRL-AI\build\net48\NeonRLBridge.dll
 C:\Users\Kegan\Neon-White-DRL-AI\build\net48\NeonRLBridge.pdb
 C:\Users\Kegan\Neon-White-DRL-AI\NeonRLBridge\obj\Release\net48\NeonRLBridge.dll
 C:\Users\Kegan\Neon-White-DRL-AI\NeonRLBridge\obj\Release\net48\NeonRLBridge.pdb
+C:\Users\Kegan\Neon-White-DRL-AI\NeonRLBridge\obj\Release\net48\NeonRLBridge.sourcelink.json

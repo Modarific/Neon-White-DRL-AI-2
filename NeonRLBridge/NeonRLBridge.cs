@@ -1522,14 +1522,34 @@ namespace NeonRLBridge
                 next.a = next.moveRight < -MovementThreshold;
             }
 
-            next.jumpDown = next.jump && !previous.jump;
-            next.jumpUp = !next.jump && previous.jump;
-            next.shootDown = next.shoot && !previous.shoot;
-            next.shootUp = !next.shoot && previous.shoot;
-            next.useDown = next.use && !previous.use;
-            next.useUp = !next.use && previous.use;
-            next.resetDown = next.reset && !previous.reset;
-            next.resetUp = !next.reset && previous.reset;
+            next.jumpDown   = next.jump && !previous.jump;
+            next.jumpUp     = !next.jump && previous.jump;
+            next.shootDown  = next.shoot && !previous.shoot;
+            next.shootUp    = !next.shoot && previous.shoot;
+            next.useDown    = next.use && !previous.use;
+            next.useUp      = !next.use && previous.use;
+            next.resetDown  = next.reset && !previous.reset;
+            next.resetUp    = !next.reset && previous.reset;
+
+            // === Begin addition ===
+            // If reset is pressed on this frame, also trigger a jump press
+            // to confirm the restart.  This causes the Space key to be
+            // pressed for one tick right after F, allowing the level restart
+            // prompt to be accepted automatically.
+            if (next.resetDown)
+            {
+                // Force jump on this frame
+                next.jump = true;
+                // Mark the jump as a down event relative to the previous frame
+                next.jumpDown = !previous.jump;
+                // Clear jumpUp since we’re forcing jump down
+                next.jumpUp = false;
+
+                // Clear the reset request so Key.F is released immediately
+                // on the next frame instead of being held for overrideTimeout.
+                desired.reset = false;
+            }
+            // === End addition ===
 
             next.wDown = next.w && !previous.w;
             next.wUp = !next.w && previous.w;

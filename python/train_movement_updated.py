@@ -75,56 +75,95 @@ LOOK_SCALE = 10.0
 
 def ensure_pyautogui():
     """
-    Lazily import and configure pyautogui.  We only import this module if
-    --control-enabled was passed to avoid unnecessary dependencies.
+    Deprecated: Previously used to import and configure pyautogui when
+    --control-enabled was passed.  The current implementation of the
+    training script no longer relies on pyautogui for resets; instead, it
+    sends reset and start commands through the RL bridge directly using
+    environment actions.  This function remains for backwards
+    compatibility but is no longer used.
     """
-    try:
-        import pyautogui
-    except ImportError as exc:
-        raise RuntimeError("--control-enabled requires the pyautogui package (pip install pyautogui)") from exc
-    # Disable the pyautogui fail‑safe so that the mouse movement to the corner
-    # doesn’t unexpectedly interrupt training.
-    pyautogui.FAILSAFE = False
-    return pyautogui
+    raise RuntimeError("pyautogui is no longer used by this script")
 
 
 def press_sequence(pyauto, keys, press_duration=0.08, gap=0.12):
     """
-    Press a sequence of keys using pyautogui.
-
-    Each key is held down for `press_duration` seconds before being released.
-    A gap of `gap` seconds is inserted between keys.  If gap is zero or
-    negative no additional delay is inserted.
+    Deprecated: Previously used to press a sequence of keys via pyautogui.
+    This function is no longer called, because resets are now performed
+    entirely via environment actions rather than through OS‑level input.
     """
-    for key in keys:
-        pyauto.keyDown(key)
-        time.sleep(press_duration)
-        pyauto.keyUp(key)
-        if gap > 0:
-            time.sleep(gap)
+    raise RuntimeError("press_sequence is no longer used; resets are handled via env.step")
 
 
 def send_start_pulse(pyauto):
     """
-    Send a single space bar press to start/resume the level.  This is used
-    after the first environment reset to synchronise the RL environment with
-    the game state.  In the updated reset behaviour we do not call this
-    function after every reset since space is already pressed as part of the
-    reset sequence.
+    Deprecated: In earlier versions of this script, a start pulse was sent via
+    pyautogui to press Space.  The new implementation uses the RL bridge
+    directly and issues a jump action through env.step instead.  This
+    function should not be called.
     """
-    press_sequence(pyauto, ['space'])
+    raise RuntimeError("send_start_pulse is no longer used; use send_start_action instead")
 
 
 def send_reset_sequence(pyauto):
     """
-    Send the in‑game reset sequence.  In Neon White, pressing the F key
-    brings up the restart prompt.  The actual confirmation is handled
-    separately by pressing space later via send_start_pulse.  We avoid
-    sending space here because doing so too early can leave the game in a
-    black screen state.  Instead, press F only and allow the training loop
-    to send space after the environment has been reset.
+    Deprecated: Previously sent the F and Space keys via pyautogui to
+    reset the level.  Resets are now accomplished by sending a reset
+    action through the RL bridge (see send_reset_action).  This function
+    should not be called.
     """
-    press_sequence(pyauto, ['f'])
+    raise RuntimeError("send_reset_sequence is no longer used; use send_reset_action instead")
+
+
+# -----------------------------------------------------------------------------
+# New helper functions: interacting with the game via the RL bridge
+# -----------------------------------------------------------------------------
+def send_start_action(env: NeonWhiteEnv) -> None:
+    """
+    Send a jump action through the environment to start the level.  This
+    function issues a single step with 'jump' set to True and then waits
+    briefly.  The RL bridge will translate this into a Space key press
+    inside the game.  It should be used immediately after the initial
+    env.reset() call to start or resume the level without relying on
+    pyautogui.
+    """
+    action = {
+        "move": [0.0, 0.0],
+        "look": [0.0, 0.0],
+        "jump": True,
+        "shoot": False,
+        "use": False,
+        "reset": False,
+    }
+    # One step to press space
+    env.step(action)
+    # Wait a short time to allow the game to register the jump
+    time.sleep(0.1)
+
+
+def send_reset_action(env: NeonWhiteEnv) -> None:
+    """
+    Send a reset command through the RL bridge.  This issues a single step
+    with the 'reset' flag set to True.  The patched NeonRLBridge
+    automatically translates a reset into pressing F and Space within the
+    game, so this function replaces the pyautogui-based reset sequence.
+
+    After calling this function you should wait briefly and then call
+    env.reset() to synchronise the observation state with the new level
+    state.  A short pause allows the game to process the restart.
+    """
+    action = {
+        "move": [0.0, 0.0],
+        "look": [0.0, 0.0],
+        "jump": False,
+        "shoot": False,
+        "use": False,
+        "reset": True,
+    }
+    # Send the reset action via env.step.  This should trigger F and Space
+    # inside the game due to the NeonRLBridge modifications.
+    env.step(action)
+    # Short pause to allow the reset to complete.  Tune as necessary.
+    time.sleep(0.1)
 
 
 @dataclass
@@ -379,7 +418,9 @@ def train(args: argparse.Namespace) -> None:
     )
     env = NeonWhiteEnv(config=env_config)
     control_enabled = args.control_enabled
-    pyauto = ensure_pyautogui() if control_enabled else None
+    # We no longer use pyautogui to send resets; instead, we interact
+    # with the game via the RL bridge by sending actions.  pyauto is unused.
+    pyauto = None
 
     action_mask = ActionToggles(
         move_x=args.allow_move_x,
@@ -407,13 +448,24 @@ def train(args: argparse.Namespace) -> None:
     if args.stage is not None:
         reset_options["stage"] = args.stage
     reset_options["timescale"] = args.timescale
+    # Perform the initial environment reset.  If a level is specified in
+    # reset_options this will cause the bridge to load the level.  On
+    # subsequent resets we avoid specifying the level again to prevent
+    # redundant scene loads (which can cause a black screen when the level
+    # is already active).  See `env.reset` in neon_white_rl/env.py for details【939372537959003†L204-L216】.
     obs_sample, info = env.reset(options=reset_options if reset_options else None)
+
+    # After the first reset, remove the "level" entry from reset_options so
+    # that future resets do not reload the same scene.  This avoids
+    # potential hangs when the game attempts to load a level that is
+    # already active.  We leave stage and timescale entries intact.
+    if "level" in reset_options:
+        reset_options.pop("level")
+
     if control_enabled:
-        # Send an initial start pulse so that the environment is started and
-        # synchronised.  After this initial call we rely on send_reset_sequence
-        # to press space as part of the reset.
-        send_start_pulse(pyauto)
-        time.sleep(0.2)
+        # Start the level by issuing a jump action via the RL bridge.  This
+        # replaces the old pyautogui-based start pulse.
+        send_start_action(env)
 
     stuck_seconds = max(0.0, args.stuck_seconds)
     stuck_distance = max(0.0, args.stuck_distance)
@@ -435,6 +487,31 @@ def train(args: argparse.Namespace) -> None:
     ).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate, eps=1e-5)
 
+    # Optional resume from checkpoint.  If --load-checkpoint is provided and
+    # points to a valid .pt file, load the model and optimizer state from
+    # that file and store the saved global step.  We defer assigning
+    # global_step until later so that it overrides the default of 0.
+    loaded_step: int = 0
+    if args.load_checkpoint is not None:
+        ckpt_path = Path(args.load_checkpoint).expanduser().resolve()
+        if ckpt_path.is_file():
+            try:
+                payload = torch.load(str(ckpt_path), map_location=device)
+                model_state = payload.get("model_state")
+                opt_state = payload.get("optimizer_state")
+                step_val = payload.get("step")
+                if model_state is not None:
+                    policy.load_state_dict(model_state)
+                if opt_state is not None:
+                    optimizer.load_state_dict(opt_state)
+                if isinstance(step_val, int):
+                    loaded_step = step_val
+                print(f"[train] Loaded checkpoint from {ckpt_path} (step={loaded_step}).")
+            except Exception as e:
+                print(f"[train] Failed to load checkpoint from {ckpt_path}: {e}")
+        else:
+            print(f"[train] Warning: specified checkpoint file {ckpt_path} does not exist; starting from scratch.")
+
     cfg = PPOConfig(
         total_steps=args.total_steps,
         rollout_steps=args.rollout_steps,
@@ -450,9 +527,26 @@ def train(args: argparse.Namespace) -> None:
         target_kl=args.target_kl,
     )
 
-    log_dir = Path(args.log_dir).expanduser().resolve()
-    checkpoint_dir = Path(args.checkpoint_dir or (log_dir / "checkpoints")).expanduser().resolve()
-    writer = make_writer(log_dir, args.run_name)
+    # Prepare the logging and checkpoint directories.  All runs are
+    # organised under `log_dir/run_name`.  The tensorboard writer will log
+    # into this directory, and checkpoints will be saved into a
+    # "checkpoints" subdirectory.  When resuming from a checkpoint, you
+    # should specify the same run_name and supply --load-checkpoint
+    # pointing to a .pt file inside the corresponding checkpoints
+    # directory.
+    log_root = Path(args.log_dir).expanduser().resolve()
+    run_dir = log_root / args.run_name
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # If a specific checkpoint directory was supplied, use it; otherwise
+    # default to run_dir/checkpoints.  This allows users to override
+    # checkpoint storage if desired.
+    checkpoint_dir = Path(args.checkpoint_dir or (run_dir / "checkpoints")).expanduser().resolve()
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create a tensorboard writer.  We construct it directly rather than
+    # using make_writer to avoid nesting the run name twice.
+    writer = SummaryWriter(str(run_dir))
 
     rollout_buffer = RolloutBuffer(
         num_steps=cfg.rollout_steps,
@@ -467,7 +561,9 @@ def train(args: argparse.Namespace) -> None:
     current_reward = 0.0
     current_length = 0
 
-    global_step = 0
+    # Initialise the global step.  If resuming from a checkpoint, use the
+    # step value loaded earlier; otherwise start at 0.
+    global_step = loaded_step
     start_time = time.time()
     obs_tensor = torch.tensor(obs_vector, device=device, dtype=torch.float32)
     episode_start_wall = time.time()
@@ -594,6 +690,15 @@ def train(args: argparse.Namespace) -> None:
                             info['events'] = events
 
                 reward_val = float(reward)
+
+                # Debugging: print reward information if enabled.  This can help
+                # diagnose the reward shaping by showing the immediate reward at
+                # each step along with termination flags and any events.
+                if args.debug_reward:
+                    # Collect some details to make debugging easier
+                    done_flag = bool(terminated or truncated)
+                    events = info.get('events') if isinstance(info, dict) else None
+                    print(f"[debug_reward] step={global_step} reward={reward_val:.5f} done={done_flag} events={events}")
                 done_val = float(terminated or truncated)
 
                 rollout_buffer.add(
@@ -615,18 +720,19 @@ def train(args: argparse.Namespace) -> None:
                     episode_rewards.append(current_reward)
                     episode_lengths.append(current_length)
                     if control_enabled:
-                        # RESET LOGIC: press F to bring up the restart prompt, wait briefly
-                        # for the game to register the input, then call env.reset to
-                        # synchronise the environment.  After the reset completes, press
-                        # space to start the level.  A longer delay after pressing F
-                        # prevents prematurely sending space while the game is still
-                        # displaying the death screen, which can result in a black screen.
-                        send_reset_sequence(pyauto)  # press F
-                        time.sleep(0.5)            # wait for the restart prompt
+                        # RESET SEQUENCE
+                        # Send a reset command through the RL bridge.  This will
+                        # press F and Space inside the game via the patched
+                        # NeonRLBridge.  Afterwards, perform env.reset() to
+                        # synchronise the observation state.  A short pause
+                        # allows the game to process the reset.
+                        send_reset_action(env)
+                        # Call env.reset() to receive the first observation of
+                        # the new episode.  Since reset_options no longer
+                        # contains "level", this will not reload the scene.
                         next_obs, info = env.reset(options=reset_options if reset_options else None)
-                        time.sleep(0.2)            # allow the environment to reset
-                        send_start_pulse(pyauto)    # press space to start the level
-                        time.sleep(0.15)           # small gap before resuming training
+                        # Brief pause to allow the environment to settle
+                        time.sleep(0.2)
                     else:
                         stop_requested = True
                         break
@@ -820,7 +926,84 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episode-seconds", type=float, default=45.0, help="Seconds before forcing an environment reset; set <=0 to disable")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA is available")
-    return parser.parse_args()
+
+    # When resuming training you can specify the path to an existing checkpoint
+    # file via --load-checkpoint.  When this is provided, the model and
+    # optimizer states will be restored from the file and training will
+    # continue from the saved global step.  The run name should point to
+    # the directory you wish to continue logging into.
+    parser.add_argument(
+        "--load-checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Path to a checkpoint file (.pt) to resume training from.  "
+            "If supplied, the model and optimizer state will be loaded "
+            "before training begins, and global step will be restored."
+        ),
+    )
+
+    # Debugging options
+    parser.add_argument("--debug-reward", action="store_true", help="Print the reward received at each environment step for debugging")
+
+    # ----------------------------------------------------------------------
+    # Convenience toggles for isolating action components
+    #
+    # --constant-forward    : Force the agent to always move forward at maximum speed.
+    # --disable-strafe      : Disable horizontal movement (strafe left/right).
+    # --disable-shoot       : Disable shooting actions.
+    # --disable-use         : Disable use (right click) actions.
+    # --disable-jump        : Disable jumping actions.
+    # --disable-look        : Disable camera look on both axes.
+    #
+    # These flags provide a shorthand for setting the corresponding
+    # --force-move-y, --allow-move-x, --allow-shoot, --allow-use,
+    # --allow-jump, --allow-look-x, and --allow-look-y arguments.  They
+    # can be combined as needed to test specific abilities in isolation.
+    parser.add_argument("--constant-forward", action="store_true", help="Force constant forward movement (move_y=1.0)")
+    parser.add_argument("--disable-strafe", action="store_true", help="Disable horizontal movement (strafe)")
+    parser.add_argument("--disable-shoot", action="store_true", help="Disable shooting actions")
+    parser.add_argument("--disable-use", action="store_true", help="Disable use actions")
+    parser.add_argument("--disable-jump", action="store_true", help="Disable jump actions")
+    parser.add_argument("--disable-look", action="store_true", help="Disable camera look in both axes")
+
+    # Additional look control toggles
+    parser.add_argument("--disable-look-x", action="store_true", help="Disable horizontal (X-axis) camera look")
+    parser.add_argument("--disable-look-y", action="store_true", help="Disable vertical (Y-axis) camera look")
+    parser.add_argument("--constant-look-x", type=float, default=None, help="Force horizontal look to a constant value in [-1.0, 1.0]")
+    parser.add_argument("--constant-look-y", type=float, default=None, help="Force vertical look to a constant value in [-1.0, 1.0]")
+    args = parser.parse_args()
+
+    # Apply convenience toggles.  These flags override or disable specific
+    # action components by setting the appropriate force or allow variables.
+    if getattr(args, "constant_forward", False):
+        # Force move_y to 1.0 (always move forward)
+        args.force_move_y = 1.0
+    if getattr(args, "disable_strafe", False):
+        # Disable horizontal movement
+        args.allow_move_x = False
+    if getattr(args, "disable_shoot", False):
+        args.allow_shoot = False
+    if getattr(args, "disable_use", False):
+        args.allow_use = False
+    if getattr(args, "disable_jump", False):
+        args.allow_jump = False
+    if getattr(args, "disable_look", False):
+        args.allow_look_x = False
+        args.allow_look_y = False
+
+    # Individual look-axis toggles and forced values
+    if getattr(args, "disable_look_x", False):
+        args.allow_look_x = False
+    if getattr(args, "disable_look_y", False):
+        args.allow_look_y = False
+    if getattr(args, "constant_look_x", None) is not None:
+        # Clamp the constant within [-1, 1]
+        args.force_look_x = max(-1.0, min(1.0, args.constant_look_x))
+    if getattr(args, "constant_look_y", None) is not None:
+        args.force_look_y = max(-1.0, min(1.0, args.constant_look_y))
+
+    return args
 
 
 if __name__ == "__main__":
