@@ -1,0 +1,21 @@
+{
+  "levels": {
+    "1-1": {
+      "name": "TUT_MOVEMENT",
+      "goal": [ 27.0, 79.98, 257.0 ],
+      "goal_radius": 10.0,
+      "enemies": [
+      ]
+    },
+
+    "1-2": {
+      "name": "Rebirth - Killer Inside",
+      "goal": [ 0.0, 0.0, 0.0 ],
+      "goal_radius": 0.0,
+      "enemies": [
+        [ 0.0, 0.0, 0.0 ],
+        [ 0.0, 0.0, 0.0 ]
+      ]
+    }
+  }
+}

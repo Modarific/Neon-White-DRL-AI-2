@@ -4,38 +4,42 @@ from __future__ import annotations
 """
 Reinforcement learning training script for Neon White movement drills.
 
-This script is largely identical to the original `train_movement.py` from the
-`Neon-White-DRL-AI` project, with one key difference: the in‑game reset
-sequence has been modified to better mirror how a human player restarts a level
-in Neon White.  The original implementation used the RL bridge’s reset
-mechanism, which only pressed the `F` key and then relied on a separate
-`send_start_pulse` to press the space bar afterwards.  In certain cases this
-could leave the game in a hanging state, because the restart confirmation
-dialog would appear but no confirmation key was sent.
-
-To avoid this issue, `send_reset_sequence` now presses both `F` and `Space`
-in sequence whenever a reset is requested, and the training loop no longer
-calls `send_start_pulse` after each reset.  This way the reset happens
-entirely via the game’s UI (rather than through the bridge), and the
-environment reset call is used only to synchronise the observation state.
-
-See the original project for further details on PPO training and the Neon
-White environment.
+Additions in this version:
+- External per-level JSON config (goals, enemies, names).
+- CLI to add/update level entries right from the console at launch.
+- Coordinate-frame transforms for JSON coords (axis reorder, sign flips, offset, scale).
+- Optional live pos/goal debug printout to calibrate transforms.
+- Observation overrides from JSON (goal_dist/dir, nearest_enemy_* , enemies_n).
+- Termination + big reward when within goal_radius of hardcoded (transformed) goal.
+- OCR "LEVEL COMPLETE" remains optional and throttled (off by default).
+- **JSON-goal–based reward shaping** with tunable scaling, step penalty, and death/timeout/stuck penalties.
 """
 
 import argparse
+import json
 import random
 import signal
 import time
 from collections import deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Sequence
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+
+# Optional dependencies for OCR-based completion detection
+try:
+    import pytesseract  # type: ignore
+except ImportError:
+    pytesseract = None  # type: ignore
+
+try:
+    import pyautogui  # type: ignore
+except ImportError:
+    pyautogui = None  # type: ignore
 
 if __package__ in (None, ""):
     import sys
@@ -65,113 +69,41 @@ OBS_KEYS: List[str] = [
     "enemies_n",
 ]
 
-# Dimensions for continuous and discrete action components.  The continuous
-# component controls movement and camera look, and the discrete component
-# controls jump, shoot, use and reset flags.
-CONTINUOUS_COMPONENT = 4  # move_x, move_y, look_x, look_y (normalized)
+# Action space dims
+CONTINUOUS_COMPONENT = 4  # move_x, move_y, look_x, look_y
 DISCRETE_COMPONENT = 4    # jump, shoot, use, reset
-LOOK_SCALE = 10.0
+LOOK_SCALE = 100.0
 
 
+# ===== Deprecated pyautogui helpers (guardrails) =====
 def ensure_pyautogui():
-    """
-    Deprecated: Previously used to import and configure pyautogui when
-    --control-enabled was passed.  The current implementation of the
-    training script no longer relies on pyautogui for resets; instead, it
-    sends reset and start commands through the RL bridge directly using
-    environment actions.  This function remains for backwards
-    compatibility but is no longer used.
-    """
-    raise RuntimeError("pyautogui is no longer used by this script")
-
+    raise RuntimeError("pyautogui is not used by this script")
 
 def press_sequence(pyauto, keys, press_duration=0.08, gap=0.12):
-    """
-    Deprecated: Previously used to press a sequence of keys via pyautogui.
-    This function is no longer called, because resets are now performed
-    entirely via environment actions rather than through OS‑level input.
-    """
-    raise RuntimeError("press_sequence is no longer used; resets are handled via env.step")
-
+    raise RuntimeError("press_sequence is not used; resets are handled via env.step")
 
 def send_start_pulse(pyauto):
-    """
-    Deprecated: In earlier versions of this script, a start pulse was sent via
-    pyautogui to press Space.  The new implementation uses the RL bridge
-    directly and issues a jump action through env.step instead.  This
-    function should not be called.
-    """
-    raise RuntimeError("send_start_pulse is no longer used; use send_start_action instead")
-
+    raise RuntimeError("send_start_pulse is not used; use send_start_action instead")
 
 def send_reset_sequence(pyauto):
-    """
-    Deprecated: Previously sent the F and Space keys via pyautogui to
-    reset the level.  Resets are now accomplished by sending a reset
-    action through the RL bridge (see send_reset_action).  This function
-    should not be called.
-    """
-    raise RuntimeError("send_reset_sequence is no longer used; use send_reset_action instead")
+    raise RuntimeError("send_reset_sequence is not used; use send_reset_action instead")
 
 
-# -----------------------------------------------------------------------------
-# New helper functions: interacting with the game via the RL bridge
-# -----------------------------------------------------------------------------
+# ================== Env interaction via RL bridge =================
 def send_start_action(env: NeonWhiteEnv) -> None:
-    """
-    Send a jump action through the environment to start the level.  This
-    function issues a single step with 'jump' set to True and then waits
-    briefly.  The RL bridge will translate this into a Space key press
-    inside the game.  It should be used immediately after the initial
-    env.reset() call to start or resume the level without relying on
-    pyautogui.
-    """
-    action = {
-        "move": [0.0, 0.0],
-        "look": [0.0, 0.0],
-        "jump": True,
-        "shoot": False,
-        "use": False,
-        "reset": False,
-    }
-    # One step to press space
+    action = {"move": [0.0, 0.0], "look": [0.0, 0.0], "jump": True, "shoot": False, "use": False, "reset": False}
     env.step(action)
-    # Wait a short time to allow the game to register the jump
     time.sleep(0.1)
-
 
 def send_reset_action(env: NeonWhiteEnv) -> None:
-    """
-    Send a reset command through the RL bridge.  This issues a single step
-    with the 'reset' flag set to True.  The patched NeonRLBridge
-    automatically translates a reset into pressing F and Space within the
-    game, so this function replaces the pyautogui-based reset sequence.
-
-    After calling this function you should wait briefly and then call
-    env.reset() to synchronise the observation state with the new level
-    state.  A short pause allows the game to process the restart.
-    """
-    action = {
-        "move": [0.0, 0.0],
-        "look": [0.0, 0.0],
-        "jump": False,
-        "shoot": False,
-        "use": False,
-        "reset": True,
-    }
-    # Send the reset action via env.step.  This should trigger F and Space
-    # inside the game due to the NeonRLBridge modifications.
+    action = {"move": [0.0, 0.0], "look": [0.0, 0.0], "jump": False, "shoot": False, "use": False, "reset": True}
     env.step(action)
-    # Short pause to allow the reset to complete.  Tune as necessary.
     time.sleep(0.1)
 
 
+# ============================== Action toggles ================================
 @dataclass
 class ActionToggles:
-    """
-    Flags indicating which action dimensions are allowed to vary.  If a flag
-    is False the corresponding action component will be zeroed out.
-    """
     move_x: bool = True
     move_y: bool = True
     look_x: bool = True
@@ -181,13 +113,8 @@ class ActionToggles:
     use: bool = True
     reset: bool = False
 
-
 @dataclass
 class ActionForces:
-    """
-    Constant values that override sampled actions.  If any field is not None
-    the corresponding action component will be forced to the specified value.
-    """
     move_x: Optional[float] = None
     move_y: Optional[float] = None
     look_x: Optional[float] = None
@@ -197,110 +124,197 @@ class ActionForces:
     use: Optional[bool] = None
 
     def is_active(self) -> bool:
-        return any(value is not None for value in (
-            self.move_x,
-            self.move_y,
-            self.look_x,
-            self.look_y,
-            self.jump,
-            self.shoot,
-            self.use,
+        return any(v is not None for v in (
+            self.move_x, self.move_y, self.look_x, self.look_y,
+            self.jump, self.shoot, self.use
         ))
 
 
 def apply_action_mask(continuous: torch.Tensor, discrete: torch.Tensor, mask: ActionToggles) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Zero out action components according to the provided mask.  This is used to
-    restrict the agent from using certain inputs (e.g., disabling jump).
-    """
     cont = continuous.clone()
     disc = discrete.clone()
-    if not mask.move_x:
-        cont[..., 0] = 0.0
-    if not mask.move_y:
-        cont[..., 1] = 0.0
-    if not mask.look_x:
-        cont[..., 2] = 0.0
-    if not mask.look_y:
-        cont[..., 3] = 0.0
-    if not mask.jump:
-        disc[..., 0] = 0.0
-    if not mask.shoot:
-        disc[..., 1] = 0.0
-    if not mask.use:
-        disc[..., 2] = 0.0
-    if not mask.reset:
-        disc[..., 3] = 0.0
+    if not mask.move_x: cont[..., 0] = 0.0
+    if not mask.move_y: cont[..., 1] = 0.0
+    if not mask.look_x: cont[..., 2] = 0.0
+    if not mask.look_y: cont[..., 3] = 0.0
+    if not mask.jump:   disc[..., 0] = 0.0
+    if not mask.shoot:  disc[..., 1] = 0.0
+    if not mask.use:    disc[..., 2] = 0.0
+    if not mask.reset:  disc[..., 3] = 0.0
     return cont, disc
-
 
 def apply_action_forces(continuous: torch.Tensor, discrete: torch.Tensor, forces: ActionForces) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Override action components with fixed values specified in `forces`.  Returns
-    clones of the input tensors only if mutations are necessary to avoid
-    inadvertent in‑place modification.
-    """
     if not forces.is_active():
         return continuous, discrete
-
     cont = continuous
     disc = discrete
-    cont_mutated = False
-    disc_mutated = False
+    cont_mut, disc_mut = False, False
 
-    def ensure_cont() -> torch.Tensor:
-        nonlocal cont, cont_mutated
-        if not cont_mutated:
-            cont = cont.clone()
-            cont_mutated = True
+    def ensure_cont():
+        nonlocal cont, cont_mut
+        if not cont_mut:
+            cont = cont.clone(); cont_mut = True
         return cont
 
-    def ensure_disc() -> torch.Tensor:
-        nonlocal disc, disc_mutated
-        if not disc_mutated:
-            disc = disc.clone()
-            disc_mutated = True
+    def ensure_disc():
+        nonlocal disc, disc_mut
+        if not disc_mut:
+            disc = disc.clone(); disc_mut = True
         return disc
 
-    if forces.move_x is not None:
-        ensure_cont()[..., 0] = float(np.clip(forces.move_x, -1.0, 1.0))
-    if forces.move_y is not None:
-        ensure_cont()[..., 1] = float(np.clip(forces.move_y, -1.0, 1.0))
-    if forces.look_x is not None:
-        ensure_cont()[..., 2] = float(np.clip(forces.look_x, -1.0, 1.0))
-    if forces.look_y is not None:
-        ensure_cont()[..., 3] = float(np.clip(forces.look_y, -1.0, 1.0))
-
-    if forces.jump is not None:
-        ensure_disc()[..., 0] = 1.0 if bool(forces.jump) else 0.0
-    if forces.shoot is not None:
-        ensure_disc()[..., 1] = 1.0 if bool(forces.shoot) else 0.0
-    if forces.use is not None:
-        ensure_disc()[..., 2] = 1.0 if bool(forces.use) else 0.0
-
+    if forces.move_x is not None: ensure_cont()[..., 0] = float(np.clip(forces.move_x, -1.0, 1.0))
+    if forces.move_y is not None: ensure_cont()[..., 1] = float(np.clip(forces.move_y, -1.0, 1.0))
+    if forces.look_x is not None: ensure_cont()[..., 2] = float(np.clip(forces.look_x, -1.0, 1.0))
+    if forces.look_y is not None: ensure_cont()[..., 3] = float(np.clip(forces.look_y, -1.0, 1.0))
+    if forces.jump  is not None:  ensure_disc()[..., 0] = 1.0 if bool(forces.jump) else 0.0
+    if forces.shoot is not None:  ensure_disc()[..., 1] = 1.0 if bool(forces.shoot) else 0.0
+    if forces.use   is not None:  ensure_disc()[..., 2] = 1.0 if bool(forces.use) else 0.0
     return cont, disc
 
 
+# ============================ JSON level config ===============================
+def parse_vec3(s: str) -> Tuple[float, float, float]:
+    parts = [p.strip() for p in s.split(",")]
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError("Expected vec3 'x,y,z'")
+    try:
+        return (float(parts[0]), float(parts[1]), float(parts[2]))
+    except ValueError:
+        raise argparse.ArgumentTypeError("Vector must be numeric 'x,y,z'")
+
+def load_level_db(path: Path) -> Dict:
+    if not path.exists():
+        return {"levels": {}}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        if "levels" not in data or not isinstance(data["levels"], dict):
+            raise ValueError("Invalid JSON schema: missing 'levels' dict")
+        return data
+    except Exception as e:
+        raise RuntimeError(f"Failed to load level config {path}: {e}")
+
+def save_level_db(path: Path, db: Dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(db, f, indent=2)
+    print(f"[level-config] Saved to {path}")
+
+def upsert_level_entry(
+    db: Dict,
+    level_id: str,
+    name: Optional[str],
+    goal: Optional[Tuple[float, float, float]],
+    goal_radius: Optional[float],
+    enemies: Optional[List[Tuple[float, float, float]]],
+    overwrite: bool,
+) -> None:
+    levels = db.setdefault("levels", {})
+    entry = levels.get(level_id, {})
+    if entry and not overwrite:
+        if name is not None: entry["name"] = name
+        if goal is not None: entry["goal"] = list(goal)
+        if goal_radius is not None: entry["goal_radius"] = float(goal_radius)
+        if enemies is not None: entry["enemies"] = [list(e) for e in enemies]
+        levels[level_id] = entry
+        return
+    levels[level_id] = {
+        "name": name or level_id,
+        "goal": list(goal) if goal is not None else [0.0, 0.0, 0.0],
+        "goal_radius": float(goal_radius) if goal_radius is not None else 1.0,
+        "enemies": [list(e) for e in (enemies or [])],
+    }
+
+def compute_dir_and_dist(src: np.ndarray, dst: np.ndarray) -> Tuple[np.ndarray, float]:
+    v = (dst - src).astype(np.float32)
+    d = float(np.linalg.norm(v))
+    if d > 1e-6:
+        return (v / d), d
+    return np.zeros_like(v), 0.0
+
+def apply_level_overrides_inplace(obs: Dict[str, np.ndarray], level_spec: Dict) -> None:
+    """
+    Overrides goal/enemy observation fields based on a level_spec:
+      - obs['goal_dist'] (scalar)
+      - obs['goal_dir']  (vec3)
+      - obs['nearest_enemy_dist'] (scalar)
+      - obs['nearest_enemy_dir']  (vec3)
+      - obs['enemies_n'] (scalar)
+    Expects level_spec['goal'] and level_spec['enemies'] to already be in WORLD coordinates.
+    """
+    if "pos" not in obs:
+        return
+    pos = np.asarray(obs["pos"], dtype=np.float32).reshape(-1)
+    goal = np.asarray(level_spec.get("goal", [0.0, 0.0, 0.0]), dtype=np.float32).reshape(-1)
+    goal_dir, goal_dist = compute_dir_and_dist(pos, goal)
+    obs["goal_dir"] = goal_dir.astype(np.float32)
+    obs["goal_dist"] = np.array([goal_dist], dtype=np.float32)
+
+    enemies = np.asarray(level_spec.get("enemies", []), dtype=np.float32).reshape(-1, 3) if level_spec.get("enemies") else np.zeros((0,3), dtype=np.float32)
+    if enemies.shape[0] == 0:
+        obs["nearest_enemy_dir"] = np.zeros(3, dtype=np.float32)
+        obs["nearest_enemy_dist"] = np.array([0.0], dtype=np.float32)
+        obs["enemies_n"] = np.array([0.0], dtype=np.float32)
+        return
+
+    deltas = enemies - pos[None, :]
+    dists = np.linalg.norm(deltas, axis=1)
+    idx = int(np.argmin(dists))
+    nearest_delta = deltas[idx]
+    nearest_dist = float(dists[idx])
+    if nearest_dist > 1e-6:
+        nearest_dir = (nearest_delta / nearest_dist).astype(np.float32)
+    else:
+        nearest_dir = np.zeros(3, dtype=np.float32)
+
+    obs["nearest_enemy_dir"] = nearest_dir
+    obs["nearest_enemy_dist"] = np.array([nearest_dist], dtype=np.float32)
+    obs["enemies_n"] = np.array([float(enemies.shape[0])], dtype=np.float32)
+
+
+# ========================= Coordinate transform utils =========================
+def reorder(v: Sequence[float], order: str) -> np.ndarray:
+    idx = {"x": 0, "y": 1, "z": 2}
+    return np.array([v[idx[order[0]]], v[idx[order[1]]], v[idx[order[2]]]], dtype=np.float32)
+
+@dataclass
+class CoordXform:
+    order: str = "xyz"                 # e.g., "xzy" to swap Y/Z from JSON to world
+    negate_x: bool = False
+    negate_y: bool = False
+    negate_z: bool = False
+    offset: Tuple[float, float, float] = (0.0, 0.0, 0.0)
+    scale: float = 1.0
+
+    def apply(self, v_xyz: Sequence[float]) -> np.ndarray:
+        v = np.array(v_xyz, dtype=np.float32)
+        v = reorder(v, self.order)
+        if self.negate_x: v[0] = -v[0]
+        if self.negate_y: v[1] = -v[1]
+        if self.negate_z: v[2] = -v[2]
+        v = v * float(self.scale)
+        v = v + np.array(self.offset, dtype=np.float32)
+        return v
+
+def transform_level_spec(level_spec: Dict, xf: CoordXform) -> Dict:
+    out = dict(level_spec)
+    if "goal" in level_spec:
+        out["goal"] = xf.apply(level_spec["goal"]).tolist()
+    if "enemies" in level_spec and level_spec["enemies"]:
+        out["enemies"] = [xf.apply(e).tolist() for e in level_spec["enemies"]]
+    return out
+
+
+# ================================ Utilities ===================================
 def str2bool(value: str | bool) -> bool:
-    """
-    Parse a string or boolean into a boolean value.  Accepts various
-    representations such as 'true', 'false', 'yes', 'no', '1', '0'.
-    """
     if isinstance(value, bool):
         return value
     lowered = value.strip().lower()
-    if lowered in {"true", "t", "yes", "y", "1"}:
-        return True
-    if lowered in {"false", "f", "no", "n", "0"}:
-        return False
+    if lowered in {"true", "t", "yes", "y", "1"}: return True
+    if lowered in {"false", "f", "no", "n", "0"}: return False
     raise argparse.ArgumentTypeError(f"Expected boolean value, got '{value}'")
 
-
 def flatten_observation(obs: Dict[str, np.ndarray]) -> np.ndarray:
-    """
-    Flatten the structured observation dictionary into a 1D numpy array.  The
-    order of elements is defined by `OBS_KEYS`.
-    """
     pieces: List[np.ndarray] = []
     for key in OBS_KEYS:
         value = obs.get(key)
@@ -311,25 +325,43 @@ def flatten_observation(obs: Dict[str, np.ndarray]) -> np.ndarray:
     return np.concatenate(pieces, axis=0)
 
 
+# ===================== OCR (optional, throttled) =========================
+def parse_bbox(value: Optional[str]) -> Optional[Tuple[int, int, int, int]]:
+    if value is None:
+        return None
+    parts = value.split(',')
+    if len(parts) != 4:
+        raise argparse.ArgumentTypeError("Bounding box must be 'x,y,w,h'")
+    try:
+        x, y, w, h = map(int, parts)
+    except ValueError:
+        raise argparse.ArgumentTypeError("Bounding box coordinates must be integers")
+    return (x, y, w, h)
+
+def detect_level_complete_text(bbox: Optional[Tuple[int, int, int, int]]) -> bool:
+    if pytesseract is None:
+        raise RuntimeError("pytesseract not available")
+    if pyautogui is None:
+        raise RuntimeError("pyautogui not available")
+    try:
+        screenshot = pyautogui.screenshot(region=bbox) if bbox is not None else pyautogui.screenshot()
+    except Exception as e:
+        raise RuntimeError(f"Failed to capture screenshot: {e}")
+    try:
+        text = pytesseract.image_to_string(screenshot).lower()
+    except Exception as e:
+        raise RuntimeError(f"OCR failed: {e}")
+    return "level complete" in text
+
+
+# ============================ Action conversion ===============================
 def continuous_action_to_env(action: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Convert the network’s continuous action output into the environment’s expected
-    move and look vectors.  The look components are scaled by LOOK_SCALE.
-    """
     action = action.detach().cpu().numpy()
     move = action[..., :2]
     look = action[..., 2:] * LOOK_SCALE
     return move, look
 
-
-def build_action_dictionary(
-    continuous: torch.Tensor,
-    discrete: torch.Tensor,
-) -> Dict[str, object]:
-    """
-    Build the action dictionary expected by the Neon White environment.  The
-    discrete actions are thresholded at 0.5 to produce boolean commands.
-    """
+def build_action_dictionary(continuous: torch.Tensor, discrete: torch.Tensor) -> Dict[str, object]:
     move, look = continuous_action_to_env(continuous)
     disc_np = discrete.detach().cpu().numpy()
     return {
@@ -342,28 +374,19 @@ def build_action_dictionary(
     }
 
 
+# ============================ Logging & metrics ===============================
 def make_writer(log_dir: Path, run_name: str) -> SummaryWriter:
-    """
-    Create a TensorBoard SummaryWriter given a log directory and run name.  The
-    directory will be created if it does not exist.
-    """
     run_dir = log_dir / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
     return SummaryWriter(str(run_dir))
 
-
 def explained_variance(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
-    """
-    Compute the explained variance between true and predicted values.  Returns 0
-    when the target variance is zero to avoid division by zero.
-    """
     if y_true.numel() == 0:
         return 0.0
     var_y = torch.var(y_true)
     if var_y.item() == 0:
         return 0.0
     return 1.0 - torch.var(y_true - y_pred) / var_y
-
 
 def save_checkpoint(
     directory: Path,
@@ -373,11 +396,6 @@ def save_checkpoint(
     optimizer: torch.optim.Optimizer,
     config: PPOConfig,
 ) -> Path:
-    """
-    Save a checkpoint containing the current training step, model state,
-    optimizer state, and PPO configuration.  Returns the path to the saved
-    checkpoint.
-    """
     directory.mkdir(parents=True, exist_ok=True)
     checkpoint_path = directory / f"{run_name}_step_{step}.pt"
     payload = {
@@ -389,24 +407,66 @@ def save_checkpoint(
     torch.save(payload, checkpoint_path)
     return checkpoint_path
 
-
 def set_seed(seed: int) -> None:
-    """
-    Set Python, NumPy, and PyTorch random seeds for reproducibility.
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
 
+# ================================= Training ===================================
 def train(args: argparse.Namespace) -> None:
-    """
-    Main training loop for PPO.  Handles environment interaction, data
-    collection, advantage computation, and gradient updates.
-    """
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     set_seed(args.seed)
+
+    # Load / mutate level JSON if requested
+    level_db = None
+    level_spec_world = None
+    selected_level_id = None
+    level_goal_radius = None
+
+    if args.use_level_config:
+        cfg_path = Path(args.level_config).expanduser().resolve()
+        level_db = load_level_db(cfg_path)
+
+        if args.add_level:
+            if not args.level_id:
+                raise RuntimeError("--add-level requires --level-id")
+            goal = parse_vec3(args.goal) if args.goal else None
+            enemies = [parse_vec3(e) for e in (args.enemy or [])]
+            upsert_level_entry(
+                level_db,
+                level_id=args.level_id,
+                name=args.level_name,
+                goal=goal,
+                goal_radius=args.goal_radius if args.goal_radius is not None else None,
+                enemies=enemies if enemies else None,
+                overwrite=args.overwrite_level,
+            )
+            save_level_db(cfg_path, level_db)
+
+        if not args.level_id:
+            raise RuntimeError("--use-level-config requires --level-id to choose a level entry")
+        selected_level_id = args.level_id
+        level_spec_raw = level_db.get("levels", {}).get(selected_level_id)
+        if level_spec_raw is None:
+            raise RuntimeError(f"Level id '{selected_level_id}' not found in {cfg_path}")
+        level_goal_radius = float(level_spec_raw.get("goal_radius", args.goal_radius or 1.0))
+
+        # Build coordinate transform and produce WORLD-space spec
+        coord_xf = CoordXform(
+            order=args.coord_order,
+            negate_x=args.negate_x,
+            negate_y=args.negate_y,
+            negate_z=args.negate_z,
+            offset=args.coord_offset or (0.0, 0.0, 0.0),
+            scale=args.coord_scale,
+        )
+        level_spec_world = transform_level_spec(level_spec_raw, coord_xf)
+
+        print(f"[level-config] Using '{selected_level_id}' (name='{level_spec_raw.get('name', selected_level_id)}') "
+              f"goal(raw)={level_spec_raw.get('goal')} -> goal(world)={level_spec_world.get('goal')} "
+              f"radius={level_goal_radius} enemies={len(level_spec_world.get('enemies', []))} "
+              f"order={coord_xf.order} neg=({coord_xf.negate_x},{coord_xf.negate_y},{coord_xf.negate_z}) "
+              f"offset={coord_xf.offset} scale={coord_xf.scale}")
 
     env_config = NeonWhiteConfig(
         host=args.host,
@@ -418,9 +478,6 @@ def train(args: argparse.Namespace) -> None:
     )
     env = NeonWhiteEnv(config=env_config)
     control_enabled = args.control_enabled
-    # We no longer use pyautogui to send resets; instead, we interact
-    # with the game via the RL bridge by sending actions.  pyauto is unused.
-    pyauto = None
 
     action_mask = ActionToggles(
         move_x=args.allow_move_x,
@@ -448,23 +505,19 @@ def train(args: argparse.Namespace) -> None:
     if args.stage is not None:
         reset_options["stage"] = args.stage
     reset_options["timescale"] = args.timescale
-    # Perform the initial environment reset.  If a level is specified in
-    # reset_options this will cause the bridge to load the level.  On
-    # subsequent resets we avoid specifying the level again to prevent
-    # redundant scene loads (which can cause a black screen when the level
-    # is already active).  See `env.reset` in neon_white_rl/env.py for details【939372537959003†L204-L216】.
+
+    # Initial reset
     obs_sample, info = env.reset(options=reset_options if reset_options else None)
 
-    # After the first reset, remove the "level" entry from reset_options so
-    # that future resets do not reload the same scene.  This avoids
-    # potential hangs when the game attempts to load a level that is
-    # already active.  We leave stage and timescale entries intact.
+    # Avoid reloading the same scene on subsequent resets
     if "level" in reset_options:
         reset_options.pop("level")
 
+    # Apply level-config observation overrides on first obs
+    if level_spec_world is not None:
+        apply_level_overrides_inplace(obs_sample, level_spec_world)
+
     if control_enabled:
-        # Start the level by issuing a jump action via the RL bridge.  This
-        # replaces the old pyautogui-based start pulse.
         send_start_action(env)
 
     stuck_seconds = max(0.0, args.stuck_seconds)
@@ -477,6 +530,18 @@ def train(args: argparse.Namespace) -> None:
     else:
         last_motion_pos = np.zeros(3, dtype=np.float32)
     last_motion_time = time.time()
+
+    # Track previous JSON goal distance for reward shaping
+    def get_goal_dist_scalar(o: Dict[str, np.ndarray]) -> Optional[float]:
+        gd = o.get("goal_dist", None)
+        if isinstance(gd, (float, int, np.floating, np.integer)):
+            return float(gd)
+        if isinstance(gd, np.ndarray) and gd.size > 0:
+            return float(gd.reshape(-1)[0])
+        return None
+
+    prev_json_goal_dist = get_goal_dist_scalar(obs_sample)
+
     obs_vector = flatten_observation(obs_sample)
     obs_dim = int(obs_vector.shape[0])
 
@@ -487,10 +552,7 @@ def train(args: argparse.Namespace) -> None:
     ).to(device)
     optimizer = torch.optim.Adam(policy.parameters(), lr=args.learning_rate, eps=1e-5)
 
-    # Optional resume from checkpoint.  If --load-checkpoint is provided and
-    # points to a valid .pt file, load the model and optimizer state from
-    # that file and store the saved global step.  We defer assigning
-    # global_step until later so that it overrides the default of 0.
+    # Optional resume
     loaded_step: int = 0
     if args.load_checkpoint is not None:
         ckpt_path = Path(args.load_checkpoint).expanduser().resolve()
@@ -510,7 +572,7 @@ def train(args: argparse.Namespace) -> None:
             except Exception as e:
                 print(f"[train] Failed to load checkpoint from {ckpt_path}: {e}")
         else:
-            print(f"[train] Warning: specified checkpoint file {ckpt_path} does not exist; starting from scratch.")
+            print(f"[train] Warning: checkpoint {ckpt_path} not found; starting fresh.")
 
     cfg = PPOConfig(
         total_steps=args.total_steps,
@@ -527,25 +589,12 @@ def train(args: argparse.Namespace) -> None:
         target_kl=args.target_kl,
     )
 
-    # Prepare the logging and checkpoint directories.  All runs are
-    # organised under `log_dir/run_name`.  The tensorboard writer will log
-    # into this directory, and checkpoints will be saved into a
-    # "checkpoints" subdirectory.  When resuming from a checkpoint, you
-    # should specify the same run_name and supply --load-checkpoint
-    # pointing to a .pt file inside the corresponding checkpoints
-    # directory.
+    # Logging & buffers
     log_root = Path(args.log_dir).expanduser().resolve()
     run_dir = log_root / args.run_name
     run_dir.mkdir(parents=True, exist_ok=True)
-
-    # If a specific checkpoint directory was supplied, use it; otherwise
-    # default to run_dir/checkpoints.  This allows users to override
-    # checkpoint storage if desired.
     checkpoint_dir = Path(args.checkpoint_dir or (run_dir / "checkpoints")).expanduser().resolve()
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create a tensorboard writer.  We construct it directly rather than
-    # using make_writer to avoid nesting the run name twice.
     writer = SummaryWriter(str(run_dir))
 
     rollout_buffer = RolloutBuffer(
@@ -561,12 +610,17 @@ def train(args: argparse.Namespace) -> None:
     current_reward = 0.0
     current_length = 0
 
-    # Initialise the global step.  If resuming from a checkpoint, use the
-    # step value loaded earlier; otherwise start at 0.
     global_step = loaded_step
     start_time = time.time()
     obs_tensor = torch.tensor(obs_vector, device=device, dtype=torch.float32)
     episode_start_wall = time.time()
+
+    # OCR throttling state
+    last_ocr_check_step = -10**9
+    last_ocr_check_time = 0.0
+
+    # Geo debug print throttle
+    last_geo_print = 0.0
 
     action_repeat = max(1, args.action_repeat)
     repeat_steps_remaining = 0
@@ -627,8 +681,24 @@ def train(args: argparse.Namespace) -> None:
                 cached_disc_action = disc_action.clone()
 
                 action_dict = build_action_dictionary(cont_action, disc_action)
-                next_obs, reward, terminated, truncated, info = env.step(action_dict)
+                next_obs, env_reward_raw, terminated, truncated, info = env.step(action_dict)
 
+                # Apply JSON overrides to new observation (goal/enemy fields)
+                if level_spec_world is not None:
+                    apply_level_overrides_inplace(next_obs, level_spec_world)
+
+                # Optional geo debug print for calibration
+                if args.print_pos and level_spec_world is not None and (time.time() - last_geo_print) > 0.5:
+                    p = next_obs.get("pos")
+                    if p is not None:
+                        p = np.asarray(p, dtype=np.float32).reshape(-1)
+                        g = np.asarray(level_spec_world["goal"], dtype=np.float32).reshape(-1)
+                        dist = float(np.linalg.norm(p - g))
+                        print(f"[geo] pos=({p[0]:.2f},{p[1]:.2f},{p[2]:.2f}) "
+                              f"goal=({g[0]:.2f},{g[1]:.2f},{g[2]:.2f}) dist={dist:.2f} r={level_goal_radius:.2f}")
+                        last_geo_print = time.time()
+
+                # Stuck/time/death handling (events)
                 current_pos = next_obs.get('pos')
                 if isinstance(current_pos, np.ndarray):
                     current_pos = current_pos.astype(np.float32, copy=False)
@@ -654,8 +724,6 @@ def train(args: argparse.Namespace) -> None:
                             death_reason = death_reason or evt.get('payload')
 
                 if control_enabled:
-                    # If the agent dies but env.step() does not report termination,
-                    # treat it as a truncated episode and record the death reason.
                     if death_flag and not (terminated or truncated):
                         truncated = True
                         terminated = False
@@ -667,7 +735,6 @@ def train(args: argparse.Namespace) -> None:
                             info['raw_obs'] = dict(raw_info)
                         info['death_reason'] = death_reason or info.get('death_reason') or 'death'
 
-                    # Stuck detection: if minimal movement for stuck_seconds.
                     if stuck_seconds > 0 and not (terminated or truncated):
                         if time.time() - last_motion_time >= stuck_seconds:
                             truncated = True
@@ -680,7 +747,6 @@ def train(args: argparse.Namespace) -> None:
                             events.append({'type': 'stuck'})
                             info['events'] = events
 
-                    # Timeout detection: if episode runs longer than episode_seconds.
                     if timed_out and not (terminated or truncated):
                         truncated = True
                         if isinstance(info, dict):
@@ -689,18 +755,83 @@ def train(args: argparse.Namespace) -> None:
                             events.append({'type': 'timeout'})
                             info['events'] = events
 
-                reward_val = float(reward)
+                # --------- JSON-goal–based reward shaping -----------
+                reward_val = float(args.reward_env_scale) * float(env_reward_raw)
 
-                # Debugging: print reward information if enabled.  This can help
-                # diagnose the reward shaping by showing the immediate reward at
-                # each step along with termination flags and any events.
+                # progress from JSON goal distance (prev - curr)
+                curr_json_goal_dist = get_goal_dist_scalar(next_obs) if level_spec_world is not None else None
+                progress = 0.0
+                if curr_json_goal_dist is not None and prev_json_goal_dist is not None:
+                    progress = float(prev_json_goal_dist - curr_json_goal_dist)
+                    if args.reward_progress_nonneg:
+                        progress = max(progress, 0.0)
+                    if args.reward_progress_clip > 0.0:
+                        progress = float(np.clip(progress, -args.reward_progress_clip, args.reward_progress_clip))
+                    reward_val += float(args.reward_progress_scale) * progress
+
+                # constant per-step addition (can be negative as time penalty)
+                reward_val += float(args.reward_step)
+
+                # penalties on events (applied once at this step)
+                if death_flag:
+                    reward_val += float(args.reward_death_penalty)
+                if isinstance(info, dict):
+                    if any(evt.get("type") == "stuck" for evt in info.get("events", [])):
+                        reward_val += float(args.reward_stuck_penalty)
+                    if any(evt.get("type") == "timeout" for evt in info.get("events", [])):
+                        reward_val += float(args.reward_timeout_penalty)
+
+                # ----------------- JSON goal-based completion -----------------
+                if level_spec_world is not None and not (terminated or truncated):
+                    dist_val = curr_json_goal_dist
+                    if dist_val is not None and dist_val <= level_goal_radius:
+                        reward_val += args.level_complete_reward
+                        terminated = True
+                        if not isinstance(info, dict):
+                            info = {}
+                        info['level_complete'] = True
+                        info['completion_source'] = "json_goal_radius"
+                        info['finish_dist'] = dist_val
+
+                # ----------------- Optional OCR completion (throttled) --------
+                if args.detect_level_text and not (terminated or truncated):
+                    gd = curr_json_goal_dist
+                    near_goal_ok = (
+                        args.ocr_goal_dist <= 0.0
+                        or (gd is not None and gd <= float(args.ocr_goal_dist))
+                    )
+                    step_ok = (args.ocr_interval_steps <= 0) or ((global_step - last_ocr_check_step) >= int(args.ocr_interval_steps))
+                    time_ok = (args.ocr_interval_seconds <= 0.0) or ((time.time() - last_ocr_check_time) >= float(args.ocr_interval_seconds))
+                    if near_goal_ok and step_ok and time_ok:
+                        try:
+                            if detect_level_complete_text(args.level_complete_bbox):
+                                reward_val += args.level_complete_reward
+                                terminated = True
+                                if not isinstance(info, dict):
+                                    info = {}
+                                info['level_complete'] = True
+                                info['completion_source'] = "ocr"
+                        except Exception as e:
+                            if global_step == 0:
+                                print(f"[train] Warning: OCR detection failed: {e}")
+                        finally:
+                            last_ocr_check_step = global_step
+                            last_ocr_check_time = time.time()
+
+                # reward debug + telemetry
+                if level_spec_world is not None and curr_json_goal_dist is not None:
+                    writer.add_scalar("charts/json_goal_dist", curr_json_goal_dist, global_step)
+                    writer.add_scalar("charts/json_progress", progress, global_step)
+
                 if args.debug_reward:
-                    # Collect some details to make debugging easier
                     done_flag = bool(terminated or truncated)
                     events = info.get('events') if isinstance(info, dict) else None
-                    print(f"[debug_reward] step={global_step} reward={reward_val:.5f} done={done_flag} events={events}")
+                    print(f"[debug_reward] step={global_step} env={float(env_reward_raw):+.4f} "
+                          f"prog={progress:+.4f} total={reward_val:+.4f} done={done_flag} events={events}")
+
                 done_val = float(terminated or truncated)
 
+                # Store step
                 rollout_buffer.add(
                     obs=obs_tensor,
                     cont_action=cont_action,
@@ -711,31 +842,28 @@ def train(args: argparse.Namespace) -> None:
                     done=done_val,
                 )
 
+                # update trackers
                 current_reward += reward_val
                 current_length += 1
                 global_step += 1
+                prev_json_goal_dist = curr_json_goal_dist if curr_json_goal_dist is not None else prev_json_goal_dist
 
                 if terminated or truncated:
-                    # Record statistics
                     episode_rewards.append(current_reward)
                     episode_lengths.append(current_length)
                     if control_enabled:
-                        # RESET SEQUENCE
-                        # Send a reset command through the RL bridge.  This will
-                        # press F and Space inside the game via the patched
-                        # NeonRLBridge.  Afterwards, perform env.reset() to
-                        # synchronise the observation state.  A short pause
-                        # allows the game to process the reset.
                         send_reset_action(env)
-                        # Call env.reset() to receive the first observation of
-                        # the new episode.  Since reset_options no longer
-                        # contains "level", this will not reload the scene.
                         next_obs, info = env.reset(options=reset_options if reset_options else None)
-                        # Brief pause to allow the environment to settle
                         time.sleep(0.2)
                     else:
                         stop_requested = True
                         break
+
+                    # Reapply JSON overrides + reset prev distance
+                    if level_spec_world is not None:
+                        apply_level_overrides_inplace(next_obs, level_spec_world)
+                        prev_json_goal_dist = get_goal_dist_scalar(next_obs)
+
                     pos_after = next_obs.get('pos')
                     if isinstance(pos_after, np.ndarray):
                         last_motion_pos = pos_after.astype(np.float32, copy=False).copy()
@@ -753,10 +881,8 @@ def train(args: argparse.Namespace) -> None:
                 else:
                     obs_tensor = torch.tensor(flatten_observation(next_obs), device=device, dtype=torch.float32)
                     last_done = done_val
-                    last_done = done_val
-                    last_done = done_val
 
-                if info.get("escape_requested"):
+                if isinstance(info, dict) and info.get("escape_requested"):
                     stop_requested = True
                     break
 
@@ -810,7 +936,6 @@ def train(args: argparse.Namespace) -> None:
                     clip_fracs.append(clip_frac)
 
                     value_loss = 0.5 * F.mse_loss(new_values, return_batch)
-
                     entropy_loss = entropy.mean()
 
                     loss = policy_loss + cfg.vf_coef * value_loss - cfg.ent_coef * entropy_loss
@@ -860,27 +985,20 @@ def train(args: argparse.Namespace) -> None:
             if args.checkpoint_interval and (global_step // cfg.rollout_steps) % args.checkpoint_interval == 0:
                 save_checkpoint(checkpoint_dir, args.run_name, global_step, policy, optimizer, cfg)
 
-            if stop_requested:
-                break
-
+        path = save_checkpoint(checkpoint_dir, args.run_name, global_step, policy, optimizer, cfg)
         if stop_requested:
-            path = save_checkpoint(checkpoint_dir, args.run_name, global_step, policy, optimizer, cfg)
             print(f"[train] Stop requested. Saved checkpoint to {path}")
         else:
-            path = save_checkpoint(checkpoint_dir, args.run_name, global_step, policy, optimizer, cfg)
             print(f"[train] Training complete. Final checkpoint saved to {path}")
+
     finally:
         signal.signal(signal.SIGINT, original_handler)
-        writer.flush()
-        writer.close()
+        writer.flush(); writer.close()
         env.close()
 
 
+# ================================ CLI parsing =================================
 def parse_args() -> argparse.Namespace:
-    """
-    Parse command line arguments.  Provides many options for environment
-    configuration, PPO hyperparameters, and training behaviour.
-    """
     parser = argparse.ArgumentParser(description="PPO training for Neon White movement drills")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=5555)
@@ -889,98 +1007,133 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timescale", type=float, default=1.0)
     parser.add_argument("--action-rate-hz", type=float, default=60.0)
     parser.add_argument("--no-wait", action="store_true")
+
     parser.add_argument("--total-steps", type=int, default=500_000)
     parser.add_argument("--rollout-steps", type=int, default=2048)
-    parser.add_argument("--action-repeat", type=int, default=1, help="Number of consecutive env steps to repeat each chosen action (>=1)")
+    parser.add_argument("--action-repeat", type=int, default=1, help="Repeat each chosen action N steps (>=1)")
     parser.add_argument("--minibatch-size", type=int, default=256)
     parser.add_argument("--update-epochs", type=int, default=10)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--gamma", type=float, default=0.995)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
     parser.add_argument("--clip-coef", type=float, default=0.2)
     parser.add_argument("--ent-coef", type=float, default=0.01)
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--target-kl", type=float, default=0.015)
+
     parser.add_argument("--log-dir", default="runs")
     parser.add_argument("--checkpoint-dir", default=None)
     parser.add_argument("--run-name", default=f"movement_{int(time.time())}")
-    parser.add_argument("--checkpoint-interval", type=int, default=10, help="How many rollouts between checkpoints")
-    parser.add_argument("--allow-move-x", type=str2bool, default=True, help="Allow horizontal movement inputs")
-    parser.add_argument("--allow-move-y", type=str2bool, default=True, help="Allow forward/back movement inputs")
-    parser.add_argument("--allow-look-x", type=str2bool, default=True, help="Allow horizontal camera look inputs")
-    parser.add_argument("--allow-look-y", type=str2bool, default=True, help="Allow vertical camera look inputs")
-    parser.add_argument("--allow-jump", type=str2bool, default=True, help="Allow jump (space) presses")
-    parser.add_argument("--allow-shoot", type=str2bool, default=True, help="Allow shoot (left click)")
-    parser.add_argument("--allow-use", type=str2bool, default=True, help="Allow use (right click)")
-    parser.add_argument("--force-move-x", type=float, default=None, help="Force strafe axis to constant value in [-1, 1]")
-    parser.add_argument("--force-move-y", type=float, default=None, help="Force forward/back axis to constant value in [-1, 1]")
-    parser.add_argument("--force-look-x", type=float, default=None, help="Force horizontal look axis to constant value in [-1, 1]")
-    parser.add_argument("--force-look-y", type=float, default=None, help="Force vertical look axis to constant value in [-1, 1]")
-    parser.add_argument("--force-jump", type=str2bool, default=None, help="Force jump pressed (true) or released (false) each step")
-    parser.add_argument("--force-shoot", type=str2bool, default=None, help="Force shoot pressed (true) or released (false) each step")
-    parser.add_argument("--force-use", type=str2bool, default=None, help="Force use pressed (true) or released (false) each step")
-    parser.add_argument("--control-enabled", action="store_true", help="Allow trainer to send start/reset commands")
-    parser.add_argument("--stuck-seconds", type=float, default=2.0, help="Seconds of minimal movement before triggering a reset; set <=0 to disable")
-    parser.add_argument("--stuck-distance", type=float, default=0.15, help="Movement threshold in meters to consider progress for stuck detection")
-    parser.add_argument("--episode-seconds", type=float, default=45.0, help="Seconds before forcing an environment reset; set <=0 to disable")
+    parser.add_argument("--checkpoint-interval", type=int, default=30, help="How many rollouts between checkpoints")
+
+    # Action toggles/forces
+    parser.add_argument("--allow-move-x", type=str2bool, default=True)
+    parser.add_argument("--allow-move-y", type=str2bool, default=True)
+    parser.add_argument("--allow-look-x", type=str2bool, default=True)
+    parser.add_argument("--allow-look-y", type=str2bool, default=True)
+    parser.add_argument("--allow-jump", type=str2bool, default=True)
+    parser.add_argument("--allow-shoot", type=str2bool, default=True)
+    parser.add_argument("--allow-use", type=str2bool, default=True)
+    parser.add_argument("--force-move-x", type=float, default=None)
+    parser.add_argument("--force-move-y", type=float, default=None)
+    parser.add_argument("--force-look-x", type=float, default=None)
+    parser.add_argument("--force-look-y", type=float, default=None)
+    parser.add_argument("--force-jump", type=str2bool, default=None)
+    parser.add_argument("--force-shoot", type=str2bool, default=None)
+    parser.add_argument("--force-use", type=str2bool, default=None)
+
+    parser.add_argument("--control-enabled", action="store_true")
+    parser.add_argument("--stuck-seconds", type=float, default=2.0)
+    parser.add_argument("--stuck-distance", type=float, default=0.15)
+    parser.add_argument("--episode-seconds", type=float, default=45.0)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--cpu", action="store_true", help="Force CPU even if CUDA is available")
+    parser.add_argument("--cpu", action="store_true")
 
-    # When resuming training you can specify the path to an existing checkpoint
-    # file via --load-checkpoint.  When this is provided, the model and
-    # optimizer states will be restored from the file and training will
-    # continue from the saved global step.  The run name should point to
-    # the directory you wish to continue logging into.
-    parser.add_argument(
-        "--load-checkpoint",
-        type=str,
-        default=None,
-        help=(
-            "Path to a checkpoint file (.pt) to resume training from.  "
-            "If supplied, the model and optimizer state will be loaded "
-            "before training begins, and global step will be restored."
-        ),
-    )
+    # Resume
+    parser.add_argument("--load-checkpoint", type=str, default=None)
 
-    # Debugging options
-    parser.add_argument("--debug-reward", action="store_true", help="Print the reward received at each environment step for debugging")
+    # Debug
+    parser.add_argument("--debug-reward", action="store_true")
 
-    # ----------------------------------------------------------------------
-    # Convenience toggles for isolating action components
-    #
-    # --constant-forward    : Force the agent to always move forward at maximum speed.
-    # --disable-strafe      : Disable horizontal movement (strafe left/right).
-    # --disable-shoot       : Disable shooting actions.
-    # --disable-use         : Disable use (right click) actions.
-    # --disable-jump        : Disable jumping actions.
-    # --disable-look        : Disable camera look on both axes.
-    #
-    # These flags provide a shorthand for setting the corresponding
-    # --force-move-y, --allow-move-x, --allow-shoot, --allow-use,
-    # --allow-jump, --allow-look-x, and --allow-look-y arguments.  They
-    # can be combined as needed to test specific abilities in isolation.
-    parser.add_argument("--constant-forward", action="store_true", help="Force constant forward movement (move_y=1.0)")
-    parser.add_argument("--disable-strafe", action="store_true", help="Disable horizontal movement (strafe)")
-    parser.add_argument("--disable-shoot", action="store_true", help="Disable shooting actions")
-    parser.add_argument("--disable-use", action="store_true", help="Disable use actions")
-    parser.add_argument("--disable-jump", action="store_true", help="Disable jump actions")
-    parser.add_argument("--disable-look", action="store_true", help="Disable camera look in both axes")
+    # Convenience toggles
+    parser.add_argument("--constant-forward", action="store_true")
+    parser.add_argument("--disable-strafe", action="store_true")
+    parser.add_argument("--disable-shoot", action="store_true")
+    parser.add_argument("--disable-use", action="store_true")
+    parser.add_argument("--disable-jump", action="store_true")
+    parser.add_argument("--disable-look", action="store_true")
+    parser.add_argument("--disable-look-x", action="store_true")
+    parser.add_argument("--disable-look-y", action="store_true")
+    parser.add_argument("--constant-look-x", type=float, default=None)
+    parser.add_argument("--constant-look-y", type=float, default=None)
 
-    # Additional look control toggles
-    parser.add_argument("--disable-look-x", action="store_true", help="Disable horizontal (X-axis) camera look")
-    parser.add_argument("--disable-look-y", action="store_true", help="Disable vertical (Y-axis) camera look")
-    parser.add_argument("--constant-look-x", type=float, default=None, help="Force horizontal look to a constant value in [-1.0, 1.0]")
-    parser.add_argument("--constant-look-y", type=float, default=None, help="Force vertical look to a constant value in [-1.0, 1.0]")
+    # OCR detection (optional)
+    parser.add_argument("--detect-level-text", action="store_true")
+    parser.add_argument("--level-complete-bbox", type=str, default=None)
+    parser.add_argument("--level-complete-reward", type=float, default=2000.0)
+    parser.add_argument("--ocr-interval-steps", type=int, default=60)
+    parser.add_argument("--ocr-interval-seconds", type=float, default=0.0)
+    parser.add_argument("--ocr-goal-dist", type=float, default=0.0)
+
+    # ========= JSON level-config controls =========
+    parser.add_argument("--use-level-config", action="store_true",
+                        help="Use JSON-configured goal/enemy data (overrides obs fields and enables radius-based completion).")
+    parser.add_argument("--level-config", type=str, default="levels.json",
+                        help="Path to the JSON file with level specs.")
+    parser.add_argument("--level-id", type=str, default=None,
+                        help="Key of the level inside the JSON file to use.")
+    parser.add_argument("--goal-radius", type=float, default=None,
+                        help="If provided with --add-level, sets/overrides the level's goal radius. Otherwise JSON value is used.")
+    parser.add_argument("--add-level", action="store_true",
+                        help="Add or update a level entry in the JSON using CLI values, then continue training.")
+    parser.add_argument("--overwrite-level", action="store_true",
+                        help="Overwrite the entire level entry instead of merging.")
+    parser.add_argument("--goal", type=str, default=None,
+                        help="Vec3 'x,y,z' for level goal (used with --add-level).")
+    parser.add_argument("--enemy", action="append", default=None,
+                        help="Vec3 'x,y,z' for an enemy; repeat flag for multiple (used with --add-level).")
+    parser.add_argument("--level-name", type=str, default=None,
+                        help="Human-friendly name for the level (used with --add-level).")
+
+    # ======= Coordinate transform controls for JSON -> world =======
+    parser.add_argument("--coord-order",
+                        choices=["xyz","xzy","yxz","yzx","zxy","zyx"],
+                        default="xyz",
+                        help="Axis order of numbers in levels.json relative to world (default xyz).")
+    parser.add_argument("--negate-x", action="store_true", help="Flip X sign after reordering")
+    parser.add_argument("--negate-y", action="store_true", help="Flip Y sign after reordering")
+    parser.add_argument("--negate-z", action="store_true", help="Flip Z sign after reordering")
+    parser.add_argument("--coord-offset", type=str, default=None,
+                        help="Offset 'dx,dy,dz' to add to transformed coords")
+    parser.add_argument("--coord-scale", type=float, default=1.0,
+                        help="Scale factor applied to transformed coords")
+    parser.add_argument("--print-pos", action="store_true",
+                        help="Print player pos and transformed goal every ~0.5s for calibration")
+    # ===============================================================
+
+    # ======= NEW: Reward shaping knobs (JSON-goal based) =======
+    parser.add_argument("--reward-env-scale", type=float, default=0.0,
+                        help="Multiply environment's own reward (default 0 = ignore).")
+    parser.add_argument("--reward-progress-scale", type=float, default=1.0,
+                        help="Scale for per-step progress (prev_dist - curr_dist) towards JSON goal.")
+    parser.add_argument("--reward-progress-nonneg", type=str2bool, default=True,
+                        help="If true, only reward positive progress (no penalty for moving away).")
+    parser.add_argument("--reward-progress-clip", type=float, default=0.0,
+                        help="Clip absolute per-step progress before scaling (0 disables).")
+    parser.add_argument("--reward-step", type=float, default=0.0,
+                        help="Constant added each step (use negative for time penalty).")
+    parser.add_argument("--reward-death-penalty", type=float, default=0.0)
+    parser.add_argument("--reward-stuck-penalty", type=float, default=0.0)
+    parser.add_argument("--reward-timeout-penalty", type=float, default=0.0)
+    # ===========================================================
+
     args = parser.parse_args()
 
-    # Apply convenience toggles.  These flags override or disable specific
-    # action components by setting the appropriate force or allow variables.
+    # Apply convenience toggles
     if getattr(args, "constant_forward", False):
-        # Force move_y to 1.0 (always move forward)
         args.force_move_y = 1.0
     if getattr(args, "disable_strafe", False):
-        # Disable horizontal movement
         args.allow_move_x = False
     if getattr(args, "disable_shoot", False):
         args.allow_shoot = False
@@ -992,16 +1145,23 @@ def parse_args() -> argparse.Namespace:
         args.allow_look_x = False
         args.allow_look_y = False
 
-    # Individual look-axis toggles and forced values
     if getattr(args, "disable_look_x", False):
         args.allow_look_x = False
     if getattr(args, "disable_look_y", False):
         args.allow_look_y = False
     if getattr(args, "constant_look_x", None) is not None:
-        # Clamp the constant within [-1, 1]
         args.force_look_x = max(-1.0, min(1.0, args.constant_look_x))
     if getattr(args, "constant_look_y", None) is not None:
         args.force_look_y = max(-1.0, min(1.0, args.constant_look_y))
+
+    # Parse OCR bbox
+    args.level_complete_bbox = parse_bbox(args.level_complete_bbox)
+
+    # Parse coord offset vec3
+    if args.coord_offset is not None:
+        args.coord_offset = parse_vec3(args.coord_offset)
+    else:
+        args.coord_offset = None
 
     return args
 

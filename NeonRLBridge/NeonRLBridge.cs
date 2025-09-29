@@ -98,14 +98,14 @@ namespace NeonRLBridge
         // ---- Config (env-driven) ----
         int PORT = ParseIntEnv("NW_PORT", 5555);
 
-        float FINISH_RADIUS  = ParseFloatEnv("NW_REACH_RADIUS", 1.5f);
+        float FINISH_RADIUS  = ParseFloatEnv("NW_REACH_RADIUS", 4f);
         float PROGRESS_GAIN  = ParseFloatEnv("NW_W_PROGRESS",  8.0f);
         float PROGRESS_CLAMP = ParseFloatEnv("NW_PROG_CLAMP_M", 3.0f);
         float STEP_PENALTY   = ParseFloatEnv("NW_STEP_PENALTY", 0.0f);
         float FINISH_BONUS   = ParseFloatEnv("NW_FINISH_BONUS", 2000.0f);
 
         string FORCE_LEVEL   = Environment.GetEnvironmentVariable("NW_FORCE_LEVEL");
-        bool DEBUG_LOG       = GetBoolEnv("NW_BRIDGE_DEBUG", false);
+        bool DEBUG_LOG       = GetBoolEnv("NW_BRIDGE_DEBUG", true);
 
         // Player/goal find hints
         string HINT_PLAYER   = Environment.GetEnvironmentVariable("NW_PLAYER_NAME"); // optional
