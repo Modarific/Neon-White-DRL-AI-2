@@ -1,3 +1,4 @@
+#train_movement_updated.py
 #!/usr/bin/env python3
 from __future__ import annotations
 
@@ -18,6 +19,12 @@ Additions in this version:
 - Fall penalty bugfix: apply after initializing reward_val, so it isn’t overwritten.
 - **Robust fall detection**: combine info/event markers *and/or* position heuristics
   (axis threshold / one-step drop). Penalty can apply immediately or only on terminal.
+- CLI knob --look-scale to tune yaw sensitivity (reduces oversteer/twitch).
+- Dense heading/velocity alignment shaping (+cosine toward goal, small lateral penalty).
+- **Episode start gating**: only start the episode clock when the run truly begins
+  (on_move / on_action / on_timer), with optional debounce.
+- **Completion gating**: award completion once on outside→inside transition with
+  early-episode ignore and post-reset debounce to prevent repeat +freeze.
 """
 
 import argparse
@@ -423,14 +430,6 @@ def detect_fall_event(
                 why = why or "pos_drop_delta"
 
     fell = fell_info or fell_pos
-
-    # Conservative inference on terminal if needed (disabled by default)
-    # if (not fell) and (terminated or truncated) and isinstance(info, dict):
-    #     events = {e.get("type") for e in info.get("events", []) if isinstance(e, dict)}
-    #     if not (("timeout" in events) or ("stuck" in events) or info.get("level_complete")):
-    #         fell = True
-    #         why = why or "terminal_inferred"
-
     return fell, why
 
 
@@ -496,6 +495,10 @@ def set_seed(seed: int) -> None:
 def train(args: argparse.Namespace) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     set_seed(args.seed)
+
+    # Make yaw gentler if requested
+    global LOOK_SCALE
+    LOOK_SCALE = float(args.look_scale)
 
     # Load / mutate level JSON if requested
     level_db = None
@@ -620,6 +623,23 @@ def train(args: argparse.Namespace) -> None:
             return float(gd.reshape(-1)[0])
         return None
 
+    # ===== Episode start helpers (timer/velocity) =====
+    def get_time_scalar(o: Dict[str, np.ndarray]) -> Optional[float]:
+        t = o.get("time", None)
+        if t is None:
+            return None
+        arr = np.asarray(t, dtype=np.float32).reshape(-1)
+        return float(arr[0]) if arr.size > 0 else None
+
+    def get_speed(o: Dict[str, np.ndarray]) -> Optional[float]:
+        v = o.get("vel", None)
+        if v is None:
+            return None
+        arr = np.asarray(v, dtype=np.float32).reshape(-1)
+        if arr.size >= 3:
+            return float(np.linalg.norm(arr[:3]))
+        return float(np.linalg.norm(arr)) if arr.size > 0 else None
+
     # ===== Progress shaping state (baseline & warmup) =====
     last_progress_dist: Optional[float] = get_goal_dist_scalar(obs_sample) if args.enable_progress_reward else None
     progress_warmup_left: int = int(args.progress_warmup_steps) if args.enable_progress_reward else 0
@@ -701,7 +721,21 @@ def train(args: argparse.Namespace) -> None:
     global_step = loaded_step
     start_time = time.time()
     obs_tensor = torch.tensor(obs_vector, device=device, dtype=torch.float32)
-    episode_start_wall = time.time()
+
+    # ===== Episode start gating state =====
+    episode_started = (args.episode_start == "immediate")
+    episode_start_wall = time.time() if episode_started else 0.0
+    ep_reset_pos = None
+    if obs_sample.get("pos") is not None:
+        ep_reset_pos = np.asarray(obs_sample["pos"], dtype=np.float32).reshape(-1)
+    episode_steps = 0  # steps since latest reset
+
+    # ===== Completion hysteresis state =====
+    inside_goal_prev = False
+    if level_spec_world is not None:
+        _d0 = get_goal_dist_scalar(obs_sample)
+        if _d0 is not None:
+            inside_goal_prev = (_d0 <= float(level_goal_radius))
 
     # OCR throttling state
     last_ocr_check_step = -10**9
@@ -729,8 +763,10 @@ def train(args: argparse.Namespace) -> None:
             rollout_buffer.reset()
 
             for _ in range(cfg.rollout_steps):
-                elapsed = time.time() - episode_start_wall
-                timed_out = args.episode_seconds > 0 and elapsed >= args.episode_seconds
+                # Clock only runs after episode_start trigger
+                now = time.time()
+                elapsed = (now - episode_start_wall) if episode_started else 0.0
+                timed_out = (args.episode_seconds > 0) and episode_started and (elapsed >= args.episode_seconds)
 
                 use_cached = (
                     action_repeat > 1
@@ -755,6 +791,16 @@ def train(args: argparse.Namespace) -> None:
                 cont_action, disc_action = apply_action_mask(cont_action, disc_action, action_mask)
                 if forces_active:
                     cont_action, disc_action = apply_action_forces(cont_action, disc_action, action_forces)
+
+                # Start clock on first meaningful action if selected
+                if (not episode_started) and (args.episode_start == "on_action"):
+                    act_mag = float(torch.max(torch.abs(cont_action)).item())
+                    disc_nonreset = disc_action[:-1]  # ignore 'reset'
+                    disc_any = bool((disc_nonreset > 0.5).any().item())
+                    if (act_mag > float(args.start_action_eps)) or disc_any:
+                        episode_started = True
+                        episode_start_wall = time.time() + float(args.start_delay)
+                        writer.add_scalar("events/episode_started", 1, global_step)
 
                 with torch.no_grad():
                     log_prob_eval, _, value_eval, _ = policy.evaluate_actions(
@@ -785,6 +831,27 @@ def train(args: argparse.Namespace) -> None:
                         print(f"[geo] pos=({p[0]:.2f},{p[1]:.2f},{p[2]:.2f}) "
                               f"goal=({g[0]:.2f},{g[1]:.2f},{g[2]:.2f}) dist={dist:.2f} r={level_goal_radius:.2f}")
                         last_geo_print = time.time()
+
+                # Start clock on movement or game timer if selected
+                if not episode_started:
+                    started = False
+                    if args.episode_start == "on_move":
+                        spd = get_speed(next_obs)
+                        if spd is not None and spd >= float(args.start_speed_thresh):
+                            started = True
+                        elif ep_reset_pos is not None and next_obs.get("pos") is not None:
+                            p = np.asarray(next_obs["pos"], dtype=np.float32).reshape(-1)
+                            if p.size >= 3 and float(np.linalg.norm(p - ep_reset_pos)) >= float(args.start_pos_delta):
+                                started = True
+                    elif args.episode_start == "on_timer":
+                        tval = get_time_scalar(next_obs)
+                        if tval is not None and tval > 0.0:
+                            started = True
+
+                    if started:
+                        episode_started = True
+                        episode_start_wall = time.time() + float(args.start_delay)
+                        writer.add_scalar("events/episode_started", 1, global_step)
 
                 # Stuck/time/death handling (events)
                 current_pos = next_obs.get('pos')
@@ -823,7 +890,8 @@ def train(args: argparse.Namespace) -> None:
                             info['raw_obs'] = dict(raw_info)
                         info['death_reason'] = death_reason or info.get('death_reason') or 'death'
 
-                    if stuck_seconds > 0 and not (terminated or truncated):
+                    # Only consider "stuck" after start trigger
+                    if (stuck_seconds > 0) and episode_started and not (terminated or truncated):
                         if time.time() - last_motion_time >= stuck_seconds:
                             truncated = True
                             terminated = False
@@ -901,6 +969,29 @@ def train(args: argparse.Namespace) -> None:
                         progress_warmup_left -= 1
                 # -----------------------------------------------------------
 
+                # --- Heading/velocity alignment shaping ---------------------
+                try:
+                    vel_arr = np.asarray(next_obs.get("vel"), dtype=np.float32).reshape(-1)
+                    gd_arr  = np.asarray(next_obs.get("goal_dir"), dtype=np.float32).reshape(-1)
+                    if vel_arr.size >= 3 and gd_arr.size >= 3:
+                        if args.align_horizontal_only:
+                            v2 = vel_arr[[0, 2]]  # XZ plane
+                            g2 = gd_arr[[0, 2]]
+                        else:
+                            v2 = vel_arr
+                            g2 = gd_arr
+
+                        nv = float(np.linalg.norm(v2)) + 1e-8
+                        ng = float(np.linalg.norm(g2)) + 1e-8
+                        align_cos = float(np.dot(v2, g2) / (nv * ng))  # [-1, 1]
+                        reward_val += float(args.reward_align_scale) * align_cos
+
+                        proj = (np.dot(v2, g2) / (ng * ng)) * g2
+                        lateral = float(np.linalg.norm(v2 - proj))
+                        reward_val -= float(args.reward_lateral_penalty) * lateral
+                except Exception:
+                    pass
+                # ----------------------------------------------------------------
 
                 # Constant per-step term (can be negative = time penalty)
                 reward_val += float(args.reward_step)
@@ -936,17 +1027,34 @@ def train(args: argparse.Namespace) -> None:
                             print(f"[debug_reward] FALL(-{args.fall_penalty:.1f}) applied immediately ({fell_why})")
                 # ===========================================================
 
-                # ----------------- JSON goal-based completion -----------------
+                # Count step since reset (used by completion gating)
+                episode_steps += 1
+
+                # ----------------- JSON goal-based completion (gated) -----------------
                 if level_spec_world is not None and not (terminated or truncated):
                     dist_val = get_goal_dist_scalar(next_obs)
-                    if dist_val is not None and dist_val <= level_goal_radius:
-                        reward_val += args.level_complete_reward
+
+                    # Eligibility gates
+                    eligible = True
+                    if args.complete_min_steps > 0 and episode_steps <= int(args.complete_min_steps):
+                        eligible = False
+                    if args.complete_min_seconds > 0.0 and (time.time() - episode_start_wall) <= float(args.complete_min_seconds):
+                        eligible = False
+                    if str(args.complete_trigger) == "enter" and inside_goal_prev:
+                        eligible = False  # require outside->inside transition
+
+                    if (dist_val is not None) and (dist_val <= float(level_goal_radius)) and eligible:
+                        reward_val += float(args.level_complete_reward)
                         terminated = True
                         if not isinstance(info, dict):
                             info = {}
                         info['level_complete'] = True
                         info['completion_source'] = "json_goal_radius"
                         info['finish_dist'] = dist_val
+
+                    # Update hysteresis tracker
+                    if dist_val is not None:
+                        inside_goal_prev = (dist_val <= float(level_goal_radius))
 
                 # ----------------- Optional OCR completion (throttled) --------
                 if args.detect_level_text and not (terminated or truncated):
@@ -1009,7 +1117,7 @@ def train(args: argparse.Namespace) -> None:
                     if control_enabled:
                         send_reset_action(env)
                         next_obs, info = env.reset(options=reset_options if reset_options else None)
-                        time.sleep(0.2)
+                        time.sleep(max(0.0, float(args.post_reset_sleep)))
                     else:
                         stop_requested = True
                         break
@@ -1032,7 +1140,22 @@ def train(args: argparse.Namespace) -> None:
                     elif pos_after is not None:
                         last_motion_pos = np.asarray(pos_after, dtype=np.float32)
                     last_motion_time = time.time()
-                    episode_start_wall = time.time()
+
+                    # Reset episode start gating
+                    episode_started = (args.episode_start == "immediate")
+                    episode_start_wall = time.time() if episode_started else 0.0
+                    ep_reset_pos = None
+                    if next_obs.get("pos") is not None:
+                        ep_reset_pos = np.asarray(next_obs["pos"], dtype=np.float32).reshape(-1)
+                    episode_steps = 0
+
+                    # Reset completion hysteresis at spawn
+                    inside_goal_prev = False
+                    if level_spec_world is not None:
+                        _d0 = get_goal_dist_scalar(next_obs)
+                        if _d0 is not None:
+                            inside_goal_prev = (_d0 <= float(level_goal_radius))
+
                     obs_tensor = torch.tensor(flatten_observation(next_obs), device=device, dtype=torch.float32)
                     repeat_steps_remaining = 0
                     cached_cont_action = None
@@ -1273,6 +1396,43 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--print-pos", action="store_true",
                         help="Print player pos and transformed goal every ~0.5s for calibration")
     # ===============================================================
+
+    # Look sensitivity (lower = gentler yaw)
+    parser.add_argument("--look-scale", type=float, default=100.0,
+                        help="Multiply look actions before sending to env (lower = gentler yaw).")
+
+    # Alignment shaping (dense steering signal)
+    parser.add_argument("--reward-align-scale", type=float, default=0.4,
+                        help="Scale for heading/velocity alignment reward (cosine of vel vs goal_dir).")
+    parser.add_argument("--reward-lateral-penalty", type=float, default=0.02,
+                        help="Penalty per unit of lateral drift vs goal direction.")
+    parser.add_argument("--align-horizontal-only", type=str2bool, default=True,
+                        help="If true, compute alignment only in XZ plane; otherwise full 3D.")
+
+    # ======= Episode start gating (avoid pre-run time loss) =======
+    parser.add_argument("--episode-start",
+                        choices=["immediate", "on_action", "on_move", "on_timer"],
+                        default="on_move",
+                        help="When to start the episode wall-clock used for --episode-seconds.")
+    parser.add_argument("--start-speed-thresh", type=float, default=0.2,
+                        help="Speed (m/s) that counts as motion for --episode-start on_move.")
+    parser.add_argument("--start-pos-delta", type=float, default=0.05,
+                        help="Fallback displacement from reset that counts as motion if velocity is missing.")
+    parser.add_argument("--start-action-eps", type=float, default=1e-3,
+                        help="Min abs(continuous action) to count as nonzero for --episode-start on_action.")
+    parser.add_argument("--start-delay", type=float, default=0.0,
+                        help="Extra seconds to delay the episode clock after the trigger (debounce).")
+
+    # ======= Completion gating (avoid repeat completion spam) =======
+    parser.add_argument("--complete-trigger",
+                        choices=["enter", "touch"], default="enter",
+                        help="Award when entering radius from outside ('enter') or whenever inside ('touch').")
+    parser.add_argument("--complete-min-steps", type=int, default=5,
+                        help="Ignore completion for first N steps of each episode.")
+    parser.add_argument("--complete-min-seconds", type=float, default=0.15,
+                        help="Ignore completion for first T seconds of each episode.")
+    parser.add_argument("--post-reset-sleep", type=float, default=0.25,
+                        help="Sleep after env.reset to let the scene settle (seconds).")
 
     # ======= Reward shaping knobs (JSON-goal based) =======
     parser.add_argument("--reward-env-scale", type=float, default=0.0,
