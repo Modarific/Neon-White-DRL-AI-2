@@ -12,7 +12,12 @@ Additions in this version:
 - Observation overrides from JSON (goal_dist/dir, nearest_enemy_* , enemies_n).
 - Termination + big reward when within goal_radius of hardcoded (transformed) goal.
 - OCR "LEVEL COMPLETE" remains optional and throttled (off by default).
-- **JSON-goal–based reward shaping** with tunable scaling, step penalty, and death/timeout/stuck penalties.
+- JSON-goal–based reward shaping with tunable scaling, step penalty, and death/timeout/stuck penalties.
+- Fixed progress spikes by re-baselining progress on reset and warmup suppression.
+- Jump-reset guard: if goal_dist jumps up by a lot (respawn), reset baseline & warmup automatically.
+- Fall penalty bugfix: apply after initializing reward_val, so it isn’t overwritten.
+- **Robust fall detection**: combine info/event markers *and/or* position heuristics
+  (axis threshold / one-step drop). Penalty can apply immediately or only on terminal.
 """
 
 import argparse
@@ -354,6 +359,81 @@ def detect_level_complete_text(bbox: Optional[Tuple[int, int, int, int]]) -> boo
     return "level complete" in text
 
 
+# ===================== Robust fall detection helpers =====================
+def _pos_axis(o: Dict[str, np.ndarray], axis_idx: int) -> Optional[float]:
+    p = o.get("pos")
+    if p is None:
+        return None
+    arr = np.asarray(p, dtype=np.float32).reshape(-1)
+    if arr.size < axis_idx + 1:
+        return None
+    return float(arr[axis_idx])
+
+def detect_fall_event(
+    args: argparse.Namespace,
+    info: object,
+    prev_axis_val: Optional[float],
+    curr_axis_val: Optional[float],
+    terminated: bool,
+    truncated: bool,
+) -> Tuple[bool, str]:
+    """
+    Returns (fell, why). 'fell' is True if we consider this step a fall.
+    'why' is a short label for logging ('info', 'pos_threshold', 'pos_drop_delta', ...).
+    """
+    why = ""
+
+    # (A) INFO/EVENT-based detection
+    fell_info = False
+    if args.fall_detect in ("auto", "info"):
+        fall_markers = {"fall", "void", "out_of_bounds", "kill_plane", "pit", "fell", "oob", "killvolume", "kill volume"}
+        reason_lc = ""
+        death_event_flag = False
+        if isinstance(info, dict):
+            raw_info = info.get("raw_obs")
+            if isinstance(raw_info, dict):
+                reason_lc = str(raw_info.get("death_reason") or "").lower()
+                if raw_info.get("done") and not raw_info.get("reached", False):
+                    death_event_flag = True
+            # other channels
+            reason_lc = (reason_lc or str(info.get("death_reason") or "")).lower()
+            for evt in (info.get("events") or []):
+                if isinstance(evt, dict) and (evt.get("name") == "death" or evt.get("type") == "death"):
+                    death_event_flag = True
+                    payload = str(evt.get("payload") or "")
+                    if not reason_lc:
+                        reason_lc = payload.lower()
+
+        if ("death" in reason_lc) or any(m in reason_lc for m in fall_markers) or death_event_flag:
+            fell_info = True
+            why = why or "info"
+
+    # (B) POS-based detection (threshold or one-step big drop)
+    fell_pos = False
+    if args.fall_detect in ("auto", "pos"):
+        if curr_axis_val is not None and args.fall_y_threshold is not None:
+            if curr_axis_val <= float(args.fall_y_threshold):
+                fell_pos = True
+                why = why or "pos_threshold"
+        if (not fell_pos and args.fall_drop_delta is not None
+            and args.fall_drop_delta > 0
+            and prev_axis_val is not None and curr_axis_val is not None):
+            if (prev_axis_val - curr_axis_val) >= float(args.fall_drop_delta):
+                fell_pos = True
+                why = why or "pos_drop_delta"
+
+    fell = fell_info or fell_pos
+
+    # Conservative inference on terminal if needed (disabled by default)
+    # if (not fell) and (terminated or truncated) and isinstance(info, dict):
+    #     events = {e.get("type") for e in info.get("events", []) if isinstance(e, dict)}
+    #     if not (("timeout" in events) or ("stuck" in events) or info.get("level_complete")):
+    #         fell = True
+    #         why = why or "terminal_inferred"
+
+    return fell, why
+
+
 # ============================ Action conversion ===============================
 def continuous_action_to_env(action: torch.Tensor) -> Tuple[np.ndarray, np.ndarray]:
     action = action.detach().cpu().numpy()
@@ -531,7 +611,7 @@ def train(args: argparse.Namespace) -> None:
         last_motion_pos = np.zeros(3, dtype=np.float32)
     last_motion_time = time.time()
 
-    # Track previous JSON goal distance for reward shaping
+    # Helpers to read goal_dist safely
     def get_goal_dist_scalar(o: Dict[str, np.ndarray]) -> Optional[float]:
         gd = o.get("goal_dist", None)
         if isinstance(gd, (float, int, np.floating, np.integer)):
@@ -540,7 +620,15 @@ def train(args: argparse.Namespace) -> None:
             return float(gd.reshape(-1)[0])
         return None
 
-    prev_json_goal_dist = get_goal_dist_scalar(obs_sample)
+    # ===== Progress shaping state (baseline & warmup) =====
+    last_progress_dist: Optional[float] = get_goal_dist_scalar(obs_sample) if args.enable_progress_reward else None
+    progress_warmup_left: int = int(args.progress_warmup_steps) if args.enable_progress_reward else 0
+
+    # ===== Fall detection state =====
+    axis_idx = {"x": 0, "y": 1, "z": 2}[args.fall_axis]
+    prev_axis_val = _pos_axis(obs_sample, axis_idx)
+    fall_pending = False
+    fall_applied_this_ep = False
 
     obs_vector = flatten_observation(obs_sample)
     obs_dim = int(obs_vector.shape[0])
@@ -755,24 +843,69 @@ def train(args: argparse.Namespace) -> None:
                             events.append({'type': 'timeout'})
                             info['events'] = events
 
-                # --------- JSON-goal–based reward shaping -----------
+                # --------- Initialize reward from env scale ----------
                 reward_val = float(args.reward_env_scale) * float(env_reward_raw)
 
-                # progress from JSON goal distance (prev - curr)
-                curr_json_goal_dist = get_goal_dist_scalar(next_obs) if level_spec_world is not None else None
-                progress = 0.0
-                if curr_json_goal_dist is not None and prev_json_goal_dist is not None:
-                    progress = float(prev_json_goal_dist - curr_json_goal_dist)
-                    if args.reward_progress_nonneg:
-                        progress = max(progress, 0.0)
-                    if args.reward_progress_clip > 0.0:
-                        progress = float(np.clip(progress, -args.reward_progress_clip, args.reward_progress_clip))
-                    reward_val += float(args.reward_progress_scale) * progress
+                # ======= Robust fall detection (info + position) =======
+                curr_axis_val = _pos_axis(next_obs, axis_idx)
+                fell_now, fell_why = detect_fall_event(
+                    args=args,
+                    info=info,
+                    prev_axis_val=prev_axis_val,
+                    curr_axis_val=curr_axis_val,
+                    terminated=terminated,
+                    truncated=truncated,
+                )
+                prev_axis_val = curr_axis_val
+                # =======================================================
 
-                # constant per-step addition (can be negative as time penalty)
+                # ----- Progress shaping (baseline/warmup + jump reset) -----
+                progress_delta = 0.0
+                if args.enable_progress_reward:
+                    curr_dist = get_goal_dist_scalar(next_obs)
+
+                    if curr_dist is not None and last_progress_dist is not None:
+                        jump_amt = curr_dist - last_progress_dist
+
+                        # 1) Big jump away from goal -> treat as respawn (apply penalty once)
+                        if args.progress_jump_reset > 0.0 and jump_amt > float(args.progress_jump_reset):
+                            if args.fall_penalty > 0 and not fall_applied_this_ep:
+                                reward_val -= float(args.fall_penalty)
+                                fall_applied_this_ep = True
+                                writer.add_scalar("events/fall", 1, global_step)
+                                writer.add_scalar("rewards/fall_penalty", -float(args.fall_penalty), global_step)
+                                if args.debug_reward:
+                                    print(f"[debug_reward] jump-reset fall penalty applied: -{args.fall_penalty} (Δdist=+{jump_amt:.2f})")
+                            # re-baseline & warmup after respawn
+                            last_progress_dist = curr_dist
+                            progress_warmup_left = max(progress_warmup_left, int(args.progress_warmup_steps))
+
+                        # 2) Normal per-step progress
+                        elif progress_warmup_left <= 0 and not (terminated or truncated):
+                            progress_delta = float(last_progress_dist - curr_dist)
+
+                            cap = float(args.progress_delta_cap) if args.progress_delta_cap and args.progress_delta_cap > 0 \
+                                else float(args.reward_progress_clip or 0.0)
+                            if args.reward_progress_nonneg:
+                                progress_delta = max(progress_delta, 0.0)
+                            if cap > 0.0:
+                                progress_delta = float(np.clip(progress_delta, -cap, cap))
+
+                            scale = float(args.reward_progress_scale if args.progress_scale is None else args.progress_scale)
+                            reward_val += scale * progress_delta
+
+                        # Always update the baseline when we have a reading
+                        last_progress_dist = curr_dist
+
+                    if progress_warmup_left > 0:
+                        progress_warmup_left -= 1
+                # -----------------------------------------------------------
+
+
+                # Constant per-step term (can be negative = time penalty)
                 reward_val += float(args.reward_step)
 
-                # penalties on events (applied once at this step)
+                # Penalties on events (applied once at this step)
                 if death_flag:
                     reward_val += float(args.reward_death_penalty)
                 if isinstance(info, dict):
@@ -781,9 +914,31 @@ def train(args: argparse.Namespace) -> None:
                     if any(evt.get("type") == "timeout" for evt in info.get("events", [])):
                         reward_val += float(args.reward_timeout_penalty)
 
+                # ======= Apply fall penalty (single-source of truth) =======
+                if args.fall_apply_on_terminal:
+                    if fell_now:
+                        fall_pending = True
+                    if (terminated or truncated) and fall_pending and (not fall_applied_this_ep):
+                        reward_val -= float(args.fall_penalty)
+                        fall_applied_this_ep = True
+                        fall_pending = False
+                        writer.add_scalar("events/fall", 1, global_step)
+                        writer.add_scalar("rewards/fall_penalty", -float(args.fall_penalty), global_step)
+                        if args.debug_reward:
+                            print(f"[debug_reward] FALL(-{args.fall_penalty:.1f}) applied on terminal ({fell_why})")
+                else:
+                    if fell_now and (not fall_applied_this_ep):
+                        reward_val -= float(args.fall_penalty)
+                        fall_applied_this_ep = True
+                        writer.add_scalar("events/fall", 1, global_step)
+                        writer.add_scalar("rewards/fall_penalty", -float(args.fall_penalty), global_step)
+                        if args.debug_reward:
+                            print(f"[debug_reward] FALL(-{args.fall_penalty:.1f}) applied immediately ({fell_why})")
+                # ===========================================================
+
                 # ----------------- JSON goal-based completion -----------------
                 if level_spec_world is not None and not (terminated or truncated):
-                    dist_val = curr_json_goal_dist
+                    dist_val = get_goal_dist_scalar(next_obs)
                     if dist_val is not None and dist_val <= level_goal_radius:
                         reward_val += args.level_complete_reward
                         terminated = True
@@ -795,7 +950,7 @@ def train(args: argparse.Namespace) -> None:
 
                 # ----------------- Optional OCR completion (throttled) --------
                 if args.detect_level_text and not (terminated or truncated):
-                    gd = curr_json_goal_dist
+                    gd = get_goal_dist_scalar(next_obs) if level_spec_world is not None else None
                     near_goal_ok = (
                         args.ocr_goal_dist <= 0.0
                         or (gd is not None and gd <= float(args.ocr_goal_dist))
@@ -819,15 +974,16 @@ def train(args: argparse.Namespace) -> None:
                             last_ocr_check_time = time.time()
 
                 # reward debug + telemetry
-                if level_spec_world is not None and curr_json_goal_dist is not None:
-                    writer.add_scalar("charts/json_goal_dist", curr_json_goal_dist, global_step)
-                    writer.add_scalar("charts/json_progress", progress, global_step)
+                curr_goal_dist = get_goal_dist_scalar(next_obs)
+                if curr_goal_dist is not None:
+                    writer.add_scalar("charts/json_goal_dist", curr_goal_dist, global_step)
+                writer.add_scalar("charts/json_progress", progress_delta, global_step)
 
                 if args.debug_reward:
                     done_flag = bool(terminated or truncated)
                     events = info.get('events') if isinstance(info, dict) else None
                     print(f"[debug_reward] step={global_step} env={float(env_reward_raw):+.4f} "
-                          f"prog={progress:+.4f} total={reward_val:+.4f} done={done_flag} events={events}")
+                          f"prog={progress_delta:+.4f} total={reward_val:+.4f} done={done_flag} events={events}")
 
                 done_val = float(terminated or truncated)
 
@@ -846,7 +1002,6 @@ def train(args: argparse.Namespace) -> None:
                 current_reward += reward_val
                 current_length += 1
                 global_step += 1
-                prev_json_goal_dist = curr_json_goal_dist if curr_json_goal_dist is not None else prev_json_goal_dist
 
                 if terminated or truncated:
                     episode_rewards.append(current_reward)
@@ -859,10 +1014,17 @@ def train(args: argparse.Namespace) -> None:
                         stop_requested = True
                         break
 
-                    # Reapply JSON overrides + reset prev distance
+                    # Reapply JSON overrides + reset progress baseline & warmup
                     if level_spec_world is not None:
                         apply_level_overrides_inplace(next_obs, level_spec_world)
-                        prev_json_goal_dist = get_goal_dist_scalar(next_obs)
+                    if args.enable_progress_reward:
+                        last_progress_dist = get_goal_dist_scalar(next_obs)
+                        progress_warmup_left = int(args.progress_warmup_steps)
+
+                    # Reset fall detector for new episode
+                    fall_pending = False
+                    fall_applied_this_ep = False
+                    prev_axis_val = _pos_axis(next_obs, axis_idx)
 
                     pos_after = next_obs.get('pos')
                     if isinstance(pos_after, np.ndarray):
@@ -1112,7 +1274,7 @@ def parse_args() -> argparse.Namespace:
                         help="Print player pos and transformed goal every ~0.5s for calibration")
     # ===============================================================
 
-    # ======= NEW: Reward shaping knobs (JSON-goal based) =======
+    # ======= Reward shaping knobs (JSON-goal based) =======
     parser.add_argument("--reward-env-scale", type=float, default=0.0,
                         help="Multiply environment's own reward (default 0 = ignore).")
     parser.add_argument("--reward-progress-scale", type=float, default=1.0,
@@ -1126,6 +1288,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reward-death-penalty", type=float, default=0.0)
     parser.add_argument("--reward-stuck-penalty", type=float, default=0.0)
     parser.add_argument("--reward-timeout-penalty", type=float, default=0.0)
+
+    parser.add_argument(
+        "--fall-penalty",
+        type=float,
+        default=20.0,
+        help="Penalty applied once when a fall/void/out-of-bounds death occurs."
+    )
+
+    # ======= NEW robust fall detection controls =======
+    parser.add_argument("--fall-detect", choices=["auto", "info", "pos"], default="auto",
+                        help="Use env info/events, position heuristics, or both (auto).")
+    parser.add_argument("--fall-axis", choices=["x", "y", "z"], default="y",
+                        help="Axis that represents 'up' for position-based fall detection.")
+    parser.add_argument("--fall-y-threshold", type=float, default=None,
+                        help="Treat pos[axis] <= this value as a fall (disabled if None).")
+    parser.add_argument("--fall-drop-delta", type=float, default=6.0,
+                        help="Treat a one-step drop >= this distance as a fall (<=0 disables).")
+    parser.add_argument("--fall-apply-on-terminal", type=str2bool, default=True,
+                        help="If true, apply penalty when the episode terminates/truncates; otherwise immediately.")
+    # ===================================================
+
+    # ======= NEW progress controls (baseline & stability) =======
+    parser.add_argument("--enable-progress-reward", type=str2bool, default=True,
+                        help="Use progress shaping based on change in goal_dist.")
+    parser.add_argument("--progress-scale", type=float, default=None,
+                        help="Alias for --reward-progress-scale; if set, overrides it.")
+    parser.add_argument("--progress-delta-cap", type=float, default=-1.0,
+                        help="Clamp |progress delta| per step; <=0 uses --reward-progress-clip; 0 disables.")
+    parser.add_argument("--progress-warmup-steps", type=int, default=3,
+                        help="Steps after reset/respawn where progress shaping is suppressed.")
+    parser.add_argument("--progress-jump-reset", type=float, default=5.0,
+                        help="If goal_dist increases by more than this in one step, treat as respawn and reset baseline. Set <=0 to disable.")
     # ===========================================================
 
     args = parser.parse_args()
@@ -1162,6 +1356,10 @@ def parse_args() -> argparse.Namespace:
         args.coord_offset = parse_vec3(args.coord_offset)
     else:
         args.coord_offset = None
+
+    # Alias: --progress-scale overrides --reward-progress-scale if set
+    if args.progress_scale is not None:
+        args.reward_progress_scale = float(args.progress_scale)
 
     return args
 
