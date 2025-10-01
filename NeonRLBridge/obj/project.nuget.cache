@@ -1,8 +1,8 @@
 {
   "version": 2,
-  "dgSpecHash": "3Kkgrs5a3zA=",
+  "dgSpecHash": "cUX7mRHGHH4=",
   "success": true,
-  "projectFilePath": "C:\\Users\\Kegan\\Neon-White-DRL-AI\\NeonRLBridge\\NeonRLBridge.csproj",
+  "projectFilePath": "C:\\Users\\Kegan\\Neon-White-DRL-AI-2-1\\NeonRLBridge\\NeonRLBridge.csproj",
   "expectedPackageFiles": [
     "C:\\Users\\Kegan\\.nuget\\packages\\microsoft.netframework.referenceassemblies\\1.0.3\\microsoft.netframework.referenceassemblies.1.0.3.nupkg.sha512",
     "C:\\Users\\Kegan\\.nuget\\packages\\microsoft.netframework.referenceassemblies.net48\\1.0.3\\microsoft.netframework.referenceassemblies.net48.1.0.3.nupkg.sha512"

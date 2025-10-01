@@ -474,6 +474,7 @@ def save_checkpoint(
     model: ActorCritic,
     optimizer: torch.optim.Optimizer,
     config: PPOConfig,
+    extras: Optional[Dict[str, object]] = None,
 ) -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     checkpoint_path = directory / f"{run_name}_step_{step}.pt"
@@ -483,6 +484,11 @@ def save_checkpoint(
         "optimizer_state": optimizer.state_dict(),
         "config": asdict(config),
     }
+    if extras:
+        try:
+            payload.update(extras)
+        except Exception:
+            pass
     torch.save(payload, checkpoint_path)
     return checkpoint_path
 
@@ -650,7 +656,11 @@ def train(args: argparse.Namespace) -> None:
     fall_pending = False
     fall_applied_this_ep = False
 
-    obs_vector = flatten_observation(obs_sample)
+    base_vec = flatten_observation(obs_sample)
+    stacker = FrameStacker(n_frames=max(1, int(args.stack_frames)), base_dim=base_vec.size)
+    stacked0 = stacker.reset_and_stack(base_vec)
+    obs_norm = ObsNormalizer(enabled=bool(args.obs_norm), clip=float(args.obs_clip))
+    obs_vector = obs_norm.normalize(stacked0)
     obs_dim = int(obs_vector.shape[0])
 
     policy = ActorCritic(
@@ -677,6 +687,22 @@ def train(args: argparse.Namespace) -> None:
                 if isinstance(step_val, int):
                     loaded_step = step_val
                 print(f"[train] Loaded checkpoint from {ckpt_path} (step={loaded_step}).")
+                # Resume observation normalization stats if present
+                if args.resume_obs and isinstance(payload, dict):
+                    try:
+                        on = payload.get("obs_norm")
+                        if on:
+                            obs_norm.enabled = bool(on.get("enabled", True))
+                            obs_norm.clip = float(on.get("clip", args.obs_clip))
+                            obs_norm.count = float(on.get("count", 1.0))
+                            m = on.get("mean"); v = on.get("var")
+                            obs_norm.mean = np.asarray(m, dtype=np.float32) if m is not None else obs_norm.mean
+                            obs_norm.var = np.asarray(v, dtype=np.float32) if v is not None else obs_norm.var
+                        sf = payload.get("stack_frames")
+                        if sf is not None and int(sf) != int(args.stack_frames):
+                            print(f"[train] Warning: checkpoint stack_frames={sf} != current {args.stack_frames}. Continuing.")
+                    except Exception as e:
+                        print(f"[train] Warning: failed to load obs_norm from checkpoint: {e}")
             except Exception as e:
                 print(f"[train] Failed to load checkpoint from {ckpt_path}: {e}")
         else:
@@ -718,9 +744,16 @@ def train(args: argparse.Namespace) -> None:
     current_reward = 0.0
     current_length = 0
 
+    # Curriculum trackers
+    success_window: deque[int] = deque(maxlen=int(args.curriculum_window))
+    current_timescale: float = float(args.timescale)
+    current_stage: Optional[int] = args.stage if args.stage is not None else None
+
     global_step = loaded_step
     start_time = time.time()
     obs_tensor = torch.tensor(obs_vector, device=device, dtype=torch.float32)
+    if args.obs_noise_std and float(args.obs_noise_std) > 0.0:
+        obs_tensor = obs_tensor + torch.randn_like(obs_tensor) * float(args.obs_noise_std)
 
     # ===== Episode start gating state =====
     episode_started = (args.episode_start == "immediate")
@@ -748,9 +781,14 @@ def train(args: argparse.Namespace) -> None:
     repeat_steps_remaining = 0
     cached_cont_action: Optional[torch.Tensor] = None
     cached_disc_action: Optional[torch.Tensor] = None
+    last_obs_dict = None
 
     stop_requested = False
     last_done = 0.0
+
+    updates_done = 0
+    best_is_min = (args.best_metric == "-time")
+    best_metric_value = float("inf") if best_is_min else -float("inf")
 
     def signal_handler(_sig, _frame):
         nonlocal stop_requested
@@ -814,8 +852,24 @@ def train(args: argparse.Namespace) -> None:
                 cached_cont_action = cont_action.clone()
                 cached_disc_action = disc_action.clone()
 
+                # Optional dynamic action masking based on last observation
+                if getattr(args, 'dynamic_action_mask', False):
+                    try:
+                        en = last_obs_dict.get('enemies_n') if last_obs_dict is not None else None
+                        if en is not None:
+                            en_arr = np.asarray(en).reshape(-1)
+                            en_scalar = float(en_arr[0]) if en_arr.size > 0 else 0.0
+                            if en_scalar <= 0.0:
+                                # Disable shoot/use when no enemies
+                                disc_action = disc_action.clone()
+                                disc_action[1] = 0.0  # shoot
+                                disc_action[2] = 0.0  # use
+                    except Exception:
+                        pass
+
                 action_dict = build_action_dictionary(cont_action, disc_action)
                 next_obs, env_reward_raw, terminated, truncated, info = env.step(action_dict)
+                last_obs_dict = next_obs
 
                 # Apply JSON overrides to new observation (goal/enemy fields)
                 if level_spec_world is not None:
@@ -1114,6 +1168,36 @@ def train(args: argparse.Namespace) -> None:
                 if terminated or truncated:
                     episode_rewards.append(current_reward)
                     episode_lengths.append(current_length)
+
+                    # ----- Curriculum and timescale/stage control -----
+                    success = False
+                    if isinstance(info, dict):
+                        success = bool(info.get('level_complete', False))
+                    success_window.append(1 if success else 0)
+                    if len(success_window) > 0:
+                        rate = float(np.mean(success_window))
+                        writer.add_scalar('curriculum/success_rate', rate, global_step)
+                        if args.curriculum_enable and len(success_window) >= int(args.curriculum_window) and rate >= float(args.curriculum_threshold):
+                            if args.curriculum_timescale_step > 0 and current_timescale + float(args.curriculum_timescale_step) <= float(args.curriculum_timescale_max):
+                                current_timescale = min(float(args.curriculum_timescale_max), current_timescale + float(args.curriculum_timescale_step))
+                            elif args.curriculum_stage_min is not None and args.curriculum_stage_max is not None:
+                                if current_stage is None:
+                                    current_stage = int(args.curriculum_stage_min)
+                                else:
+                                    current_stage = min(int(args.curriculum_stage_max), int(current_stage) + int(args.curriculum_stage_step))
+                            writer.add_scalar('curriculum/timescale', current_timescale, global_step)
+                            if current_stage is not None:
+                                writer.add_scalar('curriculum/stage', int(current_stage), global_step)
+
+                    # Set next reset options for timescale/stage
+                    if args.domain_timescale_min is not None and args.domain_timescale_max is not None:
+                        reset_options['timescale'] = float(np.random.uniform(args.domain_timescale_min, args.domain_timescale_max))
+                    elif args.curriculum_enable:
+                        reset_options['timescale'] = float(current_timescale)
+                    if args.curriculum_enable and current_stage is not None:
+                        reset_options['stage'] = int(current_stage)
+                    # ---------------------------------------------------
+
                     if control_enabled:
                         send_reset_action(env)
                         next_obs, info = env.reset(options=reset_options if reset_options else None)
@@ -1156,7 +1240,12 @@ def train(args: argparse.Namespace) -> None:
                         if _d0 is not None:
                             inside_goal_prev = (_d0 <= float(level_goal_radius))
 
-                    obs_tensor = torch.tensor(flatten_observation(next_obs), device=device, dtype=torch.float32)
+                    new_vec = flatten_observation(next_obs)
+                    stacked_vec = stacker.reset_and_stack(new_vec)
+                    obs_norm.update(stacked_vec)
+                    obs_tensor = torch.tensor(obs_norm.normalize(stacked_vec), device=device, dtype=torch.float32)
+                    if args.obs_noise_std and float(args.obs_noise_std) > 0.0:
+                        obs_tensor = obs_tensor + torch.randn_like(obs_tensor) * float(args.obs_noise_std)
                     repeat_steps_remaining = 0
                     cached_cont_action = None
                     cached_disc_action = None
@@ -1164,7 +1253,12 @@ def train(args: argparse.Namespace) -> None:
                     current_length = 0
                     last_done = done_val
                 else:
-                    obs_tensor = torch.tensor(flatten_observation(next_obs), device=device, dtype=torch.float32)
+                    new_vec = flatten_observation(next_obs)
+                    stacked_vec = stacker.push_and_stack(new_vec)
+                    obs_norm.update(stacked_vec)
+                    obs_tensor = torch.tensor(obs_norm.normalize(stacked_vec), device=device, dtype=torch.float32)
+                    if args.obs_noise_std and float(args.obs_noise_std) > 0.0:
+                        obs_tensor = obs_tensor + torch.randn_like(obs_tensor) * float(args.obs_noise_std)
                     last_done = done_val
 
                 if isinstance(info, dict) and info.get("escape_requested"):
@@ -1193,6 +1287,14 @@ def train(args: argparse.Namespace) -> None:
             clip_fracs: List[float] = []
             approx_kls: List[float] = []
 
+            ent_coef_eff = cfg.ent_coef + (args.ent_final - cfg.ent_coef) * min(1.0, global_step / max(1, cfg.total_steps))
+            lr_final_val = cfg.learning_rate if args.lr_final is None else float(args.lr_final)
+            lr_eff = cfg.learning_rate + (lr_final_val - cfg.learning_rate) * min(1.0, global_step / max(1, cfg.total_steps))
+            try:
+                for pg in optimizer.param_groups:
+                    pg['lr'] = lr_eff
+            except Exception:
+                pass
             for epoch in range(cfg.update_epochs):
                 for batch in rollout_buffer.iter_minibatches(cfg.minibatch_size):
                     obs_batch = batch["obs"]
@@ -1220,14 +1322,24 @@ def train(args: argparse.Namespace) -> None:
                     clip_frac = (torch.abs(ratio - 1.0) > cfg.clip_coef).float().mean().item()
                     clip_fracs.append(clip_frac)
 
-                    value_loss = 0.5 * F.mse_loss(new_values, return_batch)
+                    if getattr(args, 'vf_clip', 0.0) and float(args.vf_clip) > 0.0:
+                        v_pred_clipped = value_batch + torch.clamp(new_values - value_batch, -float(args.vf_clip), float(args.vf_clip))
+                        v_loss_unclipped = (new_values - return_batch) ** 2
+                        v_loss_clipped = (v_pred_clipped - return_batch) ** 2
+                        value_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+                    else:
+                        value_loss = 0.5 * F.mse_loss(new_values, return_batch)
                     entropy_loss = entropy.mean()
 
-                    loss = policy_loss + cfg.vf_coef * value_loss - cfg.ent_coef * entropy_loss
+                    loss = policy_loss + cfg.vf_coef * value_loss - ent_coef_eff * entropy_loss
 
                     optimizer.zero_grad()
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+                    try:
+                        grad_norm = torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
+                        writer.add_scalar("diagnostics/grad_norm", float(grad_norm), global_step)
+                    except Exception:
+                        torch.nn.utils.clip_grad_norm_(policy.parameters(), cfg.max_grad_norm)
                     optimizer.step()
 
                 if cfg.target_kl is not None and len(approx_kls) > 0:
@@ -1258,19 +1370,108 @@ def train(args: argparse.Namespace) -> None:
                 writer.add_scalar("charts/episode_reward", np.mean(episode_rewards), global_step)
                 writer.add_scalar("charts/episode_length", np.mean(episode_lengths), global_step)
 
+            writer.add_scalar("charts/entropy_coef", ent_coef_eff, global_step)
             writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
 
             elapsed_total = time.time() - start_time
             fps = int(global_step / max(elapsed_total, 1e-6))
             writer.add_scalar("charts/fps", fps, global_step)
 
+            # Periodic evaluation
+            updates_done += 1
+            if args.eval_interval and int(args.eval_interval) > 0 and (updates_done % int(args.eval_interval) == 0):
+                success_total = 0
+                reward_total = 0.0
+                success_times: List[float] = []
+                for epi in range(int(args.eval_episodes)):
+                    eval_opts = dict(reset_options) if reset_options else {}
+                    obs_eval, info_eval = env.reset(options=eval_opts if eval_opts else None)
+                    if level_spec_world is not None:
+                        apply_level_overrides_inplace(obs_eval, level_spec_world)
+                    eval_stacker = FrameStacker(n_frames=max(1, int(args.stack_frames)), base_dim=int(base_vec.size))
+                    vec0 = flatten_observation(obs_eval)
+                    svec = eval_stacker.reset_and_stack(vec0)
+                    o_t = torch.tensor(obs_norm.normalize(svec), device=device, dtype=torch.float32)
+                    done_ep = False
+                    ep_reward = 0.0
+                    ep_steps = 0
+                    while not done_ep:
+                        with torch.no_grad():
+                            ca, da, _, _, _ = policy.act_deterministic(o_t.unsqueeze(0))
+                        ca = ca.squeeze(0); da = da.squeeze(0)
+                        ca, da = apply_action_mask(ca, da, action_mask)
+                        if forces_active:
+                            ca, da = apply_action_forces(ca, da, action_forces)
+                        a_dict = build_action_dictionary(ca, da)
+                        obs_eval, r_eval, term_eval, trunc_eval, info_eval = env.step(a_dict)
+                        if level_spec_world is not None:
+                            apply_level_overrides_inplace(obs_eval, level_spec_world)
+                        ep_reward += float(r_eval)
+                        ep_steps += 1
+                        done_ep = bool(term_eval or trunc_eval)
+                        vec = flatten_observation(obs_eval)
+                        svec = eval_stacker.push_and_stack(vec)
+                        o_t = torch.tensor(obs_norm.normalize(svec), device=device, dtype=torch.float32)
+                    reward_total += ep_reward
+                    succ = bool(isinstance(info_eval, dict) and info_eval.get("level_complete", False))
+                    if succ:
+                        success_total += 1
+                        success_times.append(ep_steps / max(1e-6, float(args.action_rate_hz)))
+                success_rate = success_total / max(1, int(args.eval_episodes))
+                avg_reward_eval = reward_total / max(1, int(args.eval_episodes))
+                avg_time_success = (float(np.mean(success_times)) if len(success_times) > 0 else float("inf"))
+                writer.add_scalar("eval/success_rate", success_rate, global_step)
+                writer.add_scalar("eval/episode_reward", avg_reward_eval, global_step)
+                if len(success_times) > 0:
+                    writer.add_scalar("eval/avg_time_success", avg_time_success, global_step)
+                if args.best_metric == "success_rate":
+                    curr_metric = success_rate
+                elif args.best_metric == "episode_reward":
+                    curr_metric = avg_reward_eval
+                else:
+                    curr_metric = avg_time_success
+                improved = (curr_metric < best_metric_value) if best_is_min else (curr_metric > best_metric_value)
+                if args.save_best and improved:
+                    best_metric_value = curr_metric
+                    extras = {
+                        "obs_norm": {
+                            "enabled": bool(args.obs_norm),
+                            "clip": float(args.obs_clip),
+                            "count": float(obs_norm.count),
+                            "mean": obs_norm.mean.tolist() if obs_norm.mean is not None else None,
+                            "var": obs_norm.var.tolist() if obs_norm.var is not None else None,
+                        },
+                        "stack_frames": int(args.stack_frames),
+                    }
+                    save_checkpoint(checkpoint_dir, args.run_name + "_best", global_step, policy, optimizer, cfg, extras=extras)
+
             if global_step >= cfg.total_steps or stop_requested:
                 break
 
             if args.checkpoint_interval and (global_step // cfg.rollout_steps) % args.checkpoint_interval == 0:
-                save_checkpoint(checkpoint_dir, args.run_name, global_step, policy, optimizer, cfg)
+                extras = {
+                    "obs_norm": {
+                        "enabled": bool(args.obs_norm),
+                        "clip": float(args.obs_clip),
+                        "count": float(obs_norm.count),
+                        "mean": obs_norm.mean.tolist() if obs_norm.mean is not None else None,
+                        "var": obs_norm.var.tolist() if obs_norm.var is not None else None,
+                    },
+                    "stack_frames": int(args.stack_frames),
+                }
+                save_checkpoint(checkpoint_dir, args.run_name, global_step, policy, optimizer, cfg, extras=extras)
 
-        path = save_checkpoint(checkpoint_dir, args.run_name, global_step, policy, optimizer, cfg)
+        extras = {
+            "obs_norm": {
+                "enabled": bool(args.obs_norm),
+                "clip": float(args.obs_clip),
+                "count": float(obs_norm.count),
+                "mean": obs_norm.mean.tolist() if obs_norm.mean is not None else None,
+                "var": obs_norm.var.tolist() if obs_norm.var is not None else None,
+            },
+            "stack_frames": int(args.stack_frames),
+        }
+        path = save_checkpoint(checkpoint_dir, args.run_name, global_step, policy, optimizer, cfg, extras=extras)
         if stop_requested:
             print(f"[train] Stop requested. Saved checkpoint to {path}")
         else:
@@ -1306,6 +1507,34 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--vf-coef", type=float, default=0.5)
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--target-kl", type=float, default=0.015)
+    parser.add_argument("--ent-final", type=float, default=0.0, help="Final entropy coefficient (linear decay from ent-coef)")
+
+    # Observation processing
+    parser.add_argument("--obs-norm", type=str2bool, default=True, help="Enable running mean/std normalization of observations")
+    parser.add_argument("--obs-clip", type=float, default=5.0, help="Clip normalized observations to [-clip, clip]")
+    parser.add_argument("--stack-frames", type=int, default=1, help="Stack N most recent observation vectors")
+
+    # Curriculum and domain randomization
+    parser.add_argument("--curriculum-enable", action="store_true")
+    parser.add_argument("--curriculum-window", type=int, default=20)
+    parser.add_argument("--curriculum-threshold", type=float, default=0.6)
+    parser.add_argument("--curriculum-timescale-step", type=float, default=0.25)
+    parser.add_argument("--curriculum-timescale-max", type=float, default=2.0)
+    parser.add_argument("--curriculum-stage-min", type=int, default=None)
+    parser.add_argument("--curriculum-stage-max", type=int, default=None)
+    parser.add_argument("--curriculum-stage-step", type=int, default=1)
+    parser.add_argument("--domain-timescale-min", type=float, default=None)
+    parser.add_argument("--domain-timescale-max", type=float, default=None)
+
+    # Advanced PPO controls and evaluation
+    parser.add_argument("--vf-clip", type=float, default=0.0, help="Value function clip epsilon (0 disables)")
+    parser.add_argument("--lr-final", type=float, default=None, help="Final learning rate (linear schedule). Default: same as --learning-rate")
+    parser.add_argument("--eval-interval", type=int, default=0, help="Evaluate every N rollout updates (0 disables)")
+    parser.add_argument("--eval-episodes", type=int, default=5, help="Episodes per evaluation")
+    parser.add_argument("--save-best", type=str2bool, default=True, help="Save best checkpoint by eval metric")
+    parser.add_argument("--best-metric", choices=["success_rate","episode_reward","-time"], default="success_rate")
+    parser.add_argument("--dynamic-action-mask", type=str2bool, default=False, help="Mask shoot/use when no enemies are present")
+    parser.add_argument("--obs-noise-std", type=float, default=0.0, help="Stddev of Gaussian noise added to normalized observations")
 
     parser.add_argument("--log-dir", default="runs")
     parser.add_argument("--checkpoint-dir", default=None)
@@ -1337,6 +1566,7 @@ def parse_args() -> argparse.Namespace:
 
     # Resume
     parser.add_argument("--load-checkpoint", type=str, default=None)
+    parser.add_argument("--resume-obs", type=str2bool, default=True, help="Load observation normalization stats from checkpoint")
 
     # Debug
     parser.add_argument("--debug-reward", action="store_true")

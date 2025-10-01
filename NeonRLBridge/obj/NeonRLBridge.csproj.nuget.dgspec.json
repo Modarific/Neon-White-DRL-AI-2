@@ -1,17 +1,17 @@
 {
   "format": 1,
   "restore": {
-    "C:\\Users\\Kegan\\Neon-White-DRL-AI\\NeonRLBridge\\NeonRLBridge.csproj": {}
+    "C:\\Users\\Kegan\\Neon-White-DRL-AI-2-1\\NeonRLBridge\\NeonRLBridge.csproj": {}
   },
   "projects": {
-    "C:\\Users\\Kegan\\Neon-White-DRL-AI\\NeonRLBridge\\NeonRLBridge.csproj": {
+    "C:\\Users\\Kegan\\Neon-White-DRL-AI-2-1\\NeonRLBridge\\NeonRLBridge.csproj": {
       "version": "1.0.0",
       "restore": {
-        "projectUniqueName": "C:\\Users\\Kegan\\Neon-White-DRL-AI\\NeonRLBridge\\NeonRLBridge.csproj",
+        "projectUniqueName": "C:\\Users\\Kegan\\Neon-White-DRL-AI-2-1\\NeonRLBridge\\NeonRLBridge.csproj",
         "projectName": "NeonRLBridge",
-        "projectPath": "C:\\Users\\Kegan\\Neon-White-DRL-AI\\NeonRLBridge\\NeonRLBridge.csproj",
+        "projectPath": "C:\\Users\\Kegan\\Neon-White-DRL-AI-2-1\\NeonRLBridge\\NeonRLBridge.csproj",
         "packagesPath": "C:\\Users\\Kegan\\.nuget\\packages\\",
-        "outputPath": "C:\\Users\\Kegan\\Neon-White-DRL-AI\\NeonRLBridge\\obj\\",
+        "outputPath": "C:\\Users\\Kegan\\Neon-White-DRL-AI-2-1\\NeonRLBridge\\obj\\",
         "projectStyle": "PackageReference",
         "configFilePaths": [
           "C:\\Users\\Kegan\\AppData\\Roaming\\NuGet\\NuGet.Config"

@@ -54,6 +54,13 @@ class TanhNormal:
         return self.normal.entropy()
 
 
+def orthogonal_init(module: nn.Module) -> None:
+    """Apply orthogonal init to Linear layers with tanh gain and zero bias."""
+    if isinstance(module, nn.Linear):
+        nn.init.orthogonal_(module.weight, gain=nn.init.calculate_gain('tanh'))
+        nn.init.zeros_(module.bias)
+
+
 class ActorCritic(nn.Module):
     def __init__(
         self,
@@ -76,6 +83,15 @@ class ActorCritic(nn.Module):
         self.actor_disc = nn.Linear(last_size, discrete_dim)
         self.value_head = nn.Linear(last_size, 1)
 
+        # Orthogonal initialization for stability
+        self.backbone.apply(orthogonal_init)
+        nn.init.orthogonal_(self.actor_mean.weight, gain=0.01)
+        nn.init.zeros_(self.actor_mean.bias)
+        nn.init.orthogonal_(self.actor_disc.weight, gain=0.01)
+        nn.init.zeros_(self.actor_disc.bias)
+        nn.init.orthogonal_(self.value_head.weight, gain=1.0)
+        nn.init.zeros_(self.value_head.bias)
+
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         return self.backbone(obs)
 
@@ -96,6 +112,17 @@ class ActorCritic(nn.Module):
         disc_action = disc_dist.sample()
         disc_log_prob = disc_dist.log_prob(disc_action).sum(-1)
         log_prob = cont_log_prob + disc_log_prob
+        entropy = cont_dist.entropy().sum(-1) + disc_dist.entropy().sum(-1)
+        return cont_action, disc_action, log_prob, value, entropy
+
+    def act_deterministic(self, obs: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Greedy action: tanh(mean) for continuous, 0.5 threshold for discrete."""
+        cont_dist, disc_dist, value = self.get_dists(obs)
+        cont_action = torch.tanh(cont_dist.mean)
+        disc_action = (disc_dist.probs >= 0.5).float()
+        log_prob_cont = cont_dist.log_prob(cont_action)
+        log_prob_disc = disc_dist.log_prob(disc_action).sum(-1)
+        log_prob = log_prob_cont + log_prob_disc
         entropy = cont_dist.entropy().sum(-1) + disc_dist.entropy().sum(-1)
         return cont_action, disc_action, log_prob, value, entropy
 

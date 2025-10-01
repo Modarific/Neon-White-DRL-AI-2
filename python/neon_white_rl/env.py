@@ -53,14 +53,14 @@ class NeonWhiteEnv(Env):
                 "vel": spaces.Box(-np.inf, np.inf, shape=(3,), dtype=np.float32),
                 "yaw": spaces.Box(-360.0, 360.0, shape=(1,), dtype=np.float32),
                 "goal_dist": spaces.Box(0.0, np.inf, shape=(1,), dtype=np.float32),
-                "goal_dir": spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32),
+                "goal_dir": spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32),
                 "grounded": spaces.MultiBinary(1),
                 "surface": spaces.Discrete(3),
                 "height_gap": spaces.Box(-np.inf, np.inf, shape=(1,), dtype=np.float32),
                 "time": spaces.Box(0.0, np.inf, shape=(1,), dtype=np.float32),
                 "stage": spaces.Discrete(4096),
                 "nearest_enemy_dist": spaces.Box(-1.0, np.inf, shape=(1,), dtype=np.float32),
-                "nearest_enemy_dir": spaces.Box(-1.0, 1.0, shape=(2,), dtype=np.float32),
+                "nearest_enemy_dir": spaces.Box(-1.0, 1.0, shape=(3,), dtype=np.float32),
                 "enemies_n": spaces.Box(
                     low=0,
                     high=self.config.enemy_buffer,
@@ -268,19 +268,31 @@ class NeonWhiteEnv(Env):
                 return arr_val
             return np.reshape(arr_val, (length,)).astype(np.float32)
 
+        def arr_pad(name: str, length: int, fallback: float = 0.0) -> np.ndarray:
+            value = obs.get(name)
+            out = np.full((length,), fallback, dtype=np.float32)
+            if value is None:
+                return out
+            arr_val = np.asarray(value, dtype=np.float32).reshape(-1)
+            n = int(arr_val.size)
+            if n >= length:
+                return arr_val[:length].astype(np.float32)
+            out[:n] = arr_val
+            return out
+
         formatted = {
             "pos": arr("pos", 3),
             "vel": arr("vel", 3),
             "yaw": np.array([obs.get("yaw_deg", 0.0)], dtype=np.float32),
             "goal_dist": np.array([obs.get("goal_dist", 0.0)], dtype=np.float32),
-            "goal_dir": arr("goal_dir", 2),
+            "goal_dir": arr_pad("goal_dir", 3),
             "grounded": np.array([1 if obs.get("grounded") else 0], dtype=np.int32),
             "surface": np.array([int(obs.get("surface", 0))], dtype=np.int32),
             "height_gap": np.array([obs.get("height_gap", 0.0)], dtype=np.float32),
             "time": np.array([obs.get("time_unscaled", 0.0)], dtype=np.float32),
             "stage": np.array([int(obs.get("stage", 0))], dtype=np.int32),
             "nearest_enemy_dist": np.array([obs.get("nearest_enemy_dist", -1.0)], dtype=np.float32),
-            "nearest_enemy_dir": arr("nearest_enemy_dir", 2),
+            "nearest_enemy_dir": arr_pad("nearest_enemy_dir", 3),
             "enemies_n": np.array([min(self.config.enemy_buffer, int(obs.get("enemies_n", 0)))], dtype=np.int32),
         }
         return formatted
